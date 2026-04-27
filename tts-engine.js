@@ -30,17 +30,15 @@ let asrModel = null;
 let tokenizer = null;
 let config = null;
 
-// ─── KV-cached main model: architecture constants ───────────────────────────
+// ─── B=1 KV main model: architecture constants ─────────────────────────────
 // Coupled to the Qwen3 LLM used by OmniVoice (see omnivoice-kv-export/). The
-// ONNX graph has 28 past_key_i/past_value_i inputs and the matching
-// present_*_i outputs. kv_heads=8 and head_dim=128 drive the KV buffer
-// shape: (batch=2, kv_heads, seq_full, head_dim) fp32 at the I/O boundary.
+// ONNX graph has 28 past_key_i/past_value_i inputs and the matching present_*_i
+// outputs. The production export is the fp16 B=1 KV graph.
 const KV_NUM_LAYERS = 28;
 const KV_HEADS = 8;
 const KV_HEAD_DIM = 128;
 // Production main model. The bridge is intentionally standardized on this one
-// artifact: fp16, KV-cached, B=1 split. Older monolithic/B=2/Q4/Q8 variants are
-// export/benchmark artifacts only and are not probed at runtime.
+// fp16 B=1 KV split artifact.
 const MAIN_MODEL_FILE = 'omnivoice-main-kv-fp16-b1.onnx';
 const MAIN_MODEL_MANIFEST = 'omnivoice-main-kv-fp16-b1-manifest.json';
 const MAIN_MODEL_VARIANT = 'kv-fp16-b1';
@@ -50,30 +48,60 @@ const DEFAULT_MODEL_BASE_URL = 'https://huggingface.co/MarkShark2/omnivoice-onnx
 // ─── ORT-WebGPU correctness diagnostics ────────────────────────────────────
 // Keep all false for the normal fast path. These toggles isolate correctness
 // regressions seen on newer ORT-WebGPU builds without changing model export.
-const DIAG_FORCE_CPU_STAGED_POSTPROC = false; // download logits, then run WGSL post-proc
-const DIAG_FORCE_JS_POSTPROC = false;         // download logits, then run JS post-proc
-const DIAG_FORCE_WASM_DECODER = false;        // bypass WebGPU decoder
-const DIAG_FORCE_CPU_KV_CACHE = false;        // keep present_kv on CPU between steps
+const DIAG_FORCE_CPU_STAGED_POSTPROC = false;
+const DIAG_FORCE_JS_POSTPROC = false;
+const DIAG_FORCE_WASM_DECODER = false;
+const DIAG_FORCE_CPU_KV_CACHE = false;
 
-let mainSessionIsKv = true;
-let mainSessionIsKvB1 = true;
+let activeRuntime = {
+  mainEp: 'webgpu',
+  decoderEp: 'webgpu',
+  encoderEp: 'webgpu',
+};
 let mainSessionVariant = MAIN_MODEL_VARIANT;
+let decoderSessionInfo = null;
 
-// ─── Progress / status tracking ─────────────────────────────────────────────
-
-window.ttsProgress = [];
+// ─── Logging ────────────────────────────────────────────────────────────────
 
 function log(stage, detail) {
   const msg = `[${stage}] ${detail}`;
   console.log(msg);
-  window.ttsProgress.push({ stage, detail, time: Date.now() });
-  const el = document.getElementById('status');
-  if (el) el.textContent = msg;
+}
+
+function errorDetail(err) {
+  if (!err) return String(err);
+  const parts = [];
+  if (err.name) parts.push(err.name);
+  if (err.message) parts.push(err.message);
+  if (!parts.length) parts.push(String(err));
+  if (err.stack) parts.push(err.stack);
+  return parts.join(': ');
+}
+
+async function fetchJsonChecked(url, label) {
+  const response = await fetch(url);
+  const body = await response.text();
+  if (!response.ok) {
+    const preview = body ? ` body=${body.slice(0, 200)}` : '';
+    throw new Error(`Failed to fetch ${label}: HTTP ${response.status} ${response.statusText} from ${url}.${preview}`);
+  }
+  try {
+    return JSON.parse(body);
+  } catch (err) {
+    throw new Error(`Invalid JSON for ${label} from ${url}: ${err.message}; body=${body.slice(0, 200)}`);
+  }
 }
 
 // ─── Tensor helper ──────────────────────────────────────────────────────────
 
 function T(type, data, dims) { return new ort.Tensor(type, data, dims); }
+
+async function tensorData(tensor) {
+  if (typeof tensor?.getData === 'function') return await tensor.getData();
+  if (tensor?.data && typeof tensor.data.slice === 'function') return tensor.data.slice();
+  if (tensor?.data) return tensor.data;
+  throw new Error('tensor has no getData() or data field');
+}
 
 // ─── Time steps (port of _get_time_steps) ───────────────────────────────────
 
@@ -230,18 +258,7 @@ function estimateTargetTokens(text, refText = null, numRefAudioTokens = null, sp
 
 // ─── Log-softmax + CFG post-processing (CPU path) ──────────────────────────
 
-const _cLP = new Float32Array(1025);
-const _uLP = new Float32Array(1025);
 const _g = new Float32Array(1025);
-
-function logSoftmaxInto(arr, offset, len, out) {
-  let max = -Infinity;
-  for (let i = 0; i < len; i++) { const v = arr[offset + i]; if (v > max) max = v; }
-  let sum = 0;
-  for (let i = 0; i < len; i++) sum += Math.exp(arr[offset + i] - max);
-  const lse = max + Math.log(sum);
-  for (let i = 0; i < len; i++) out[i] = arr[offset + i] - lse;
-}
 
 function normalizeFp16LogitsToF32(logits) {
   if (typeof Float16Array !== 'undefined' && logits instanceof Float16Array) {
@@ -253,42 +270,6 @@ function normalizeFp16LogitsToF32(logits) {
   return logits;
 }
 
-function cpuPostProcess(logits, C, maxLen, V, numTargetTokens, targetOff, maskId, guidanceScale, layerPenalty, pred, scores) {
-  // audio_logits is fp16 in the current model (see optimization #7 in README).
-  // ORT-web returns Float16Array on modern builds, Uint16Array (raw fp16 bits)
-  // on older ones. Normalize to Float32Array once; the per-V inner loops stay
-  // hot-path simple. Float32Array passes through unchanged for older graphs.
-  logits = normalizeFp16LogitsToF32(logits);
-  const gScale1 = 1 + guidanceScale;
-  for (let c = 0; c < C; c++) {
-    const layerScore = layerPenalty * c;
-    for (let t = 0; t < numTargetTokens; t++) {
-      const cOff = (c * maxLen + targetOff + t) * V;
-      const uOff = ((C + c) * maxLen + t) * V;
-      logSoftmaxInto(logits, cOff, V, _cLP);
-      logSoftmaxInto(logits, uOff, V, _uLP);
-      let mx = -Infinity;
-      for (let v = 0; v < V; v++) {
-        const gv = gScale1 * _cLP[v] - guidanceScale * _uLP[v];
-        _g[v] = gv;
-        if (gv > mx) mx = gv;
-      }
-      let sm = 0;
-      for (let v = 0; v < V; v++) sm += Math.exp(_g[v] - mx);
-      const lse = mx + Math.log(sm);
-      let bestV = 0, bestS = -Infinity;
-      for (let v = 0; v < V; v++) {
-        if (v === maskId) continue;
-        const lp = _g[v] - lse;
-        if (lp > bestS) { bestS = lp; bestV = v; }
-      }
-      const idx = c * numTargetTokens + t;
-      pred[idx] = bestV;
-      scores[idx] = bestS - layerScore;
-    }
-  }
-}
-
 function cpuPostProcessSplit(condLogits, uncondLogits, C, condMaxLen, condTargetOff, uncondMaxLen, uncondTargetOff, V, numTargetTokens, maskId, guidanceScale, layerPenalty, pred, scores) {
   condLogits = normalizeFp16LogitsToF32(condLogits);
   uncondLogits = normalizeFp16LogitsToF32(uncondLogits);
@@ -298,11 +279,9 @@ function cpuPostProcessSplit(condLogits, uncondLogits, C, condMaxLen, condTarget
     for (let t = 0; t < numTargetTokens; t++) {
       const cOff = (c * condMaxLen + condTargetOff + t) * V;
       const uOff = (c * uncondMaxLen + uncondTargetOff + t) * V;
-      logSoftmaxInto(condLogits, cOff, V, _cLP);
-      logSoftmaxInto(uncondLogits, uOff, V, _uLP);
       let mx = -Infinity;
       for (let v = 0; v < V; v++) {
-        const gv = gScale1 * _cLP[v] - guidanceScale * _uLP[v];
+        const gv = gScale1 * condLogits[cOff + v] - guidanceScale * uncondLogits[uOff + v];
         _g[v] = gv;
         if (gv > mx) mx = gv;
       }
@@ -468,40 +447,9 @@ async function generateIterative(inp, cfg, numStep, guidanceScale, tShift, layer
   const { inputIds, audioMask, totalLen, numTargetTokens, targetOff, C } = inp;
   const maskId = cfg.audio_mask_id;
   const V = cfg.audio_vocab_size;
-
   const condLen = totalLen;
   const uncondLen = numTargetTokens;
   const maxLen = condLen;
-
-  // ── Static batch buffers shared by both the monolithic path and the
-  //    KV path's step-0 (prefix) call. Shape/content identical to what the
-  //    monolithic graph has always taken: (cond row, uncond row) in a batch.
-  //    In KV mode we additionally carry position_ids + target_positions.
-
-  // Batch input_ids: (2, C, maxLen) — cond + uncond
-  const bIds = new BigInt64Array(2 * C * maxLen).fill(BigInt(maskId));
-  for (let c = 0; c < C; c++)
-    for (let s = 0; s < condLen; s++)
-      bIds[c * maxLen + s] = inputIds[c * totalLen + s];
-  for (let c = 0; c < C; c++)
-    for (let t = 0; t < uncondLen; t++)
-      bIds[(C + c) * maxLen + t] = inputIds[c * totalLen + targetOff + t];
-
-  // Batch audio_mask: (2, maxLen)
-  const bMask = new Uint8Array(2 * maxLen);
-  for (let s = 0; s < condLen; s++) bMask[s] = audioMask[s];
-  for (let t = 0; t < uncondLen; t++) bMask[maxLen + t] = 1;
-
-  // Batch attention_mask: (2, 1, maxLen, maxLen)
-  const bAttn = new Uint8Array(2 * maxLen * maxLen);
-  for (let q = 0; q < condLen; q++)
-    for (let k = 0; k < condLen; k++)
-      bAttn[q * maxLen + k] = 1;
-  for (let q = 0; q < uncondLen; q++)
-    for (let k = 0; k < uncondLen; k++)
-      bAttn[maxLen * maxLen + q * maxLen + k] = 1;
-  for (let p = uncondLen; p < maxLen; p++)
-    bAttn[maxLen * maxLen + p * maxLen + p] = 1;
 
   // Token state
   const tokens = new BigInt64Array(C * numTargetTokens).fill(BigInt(maskId));
@@ -522,138 +470,62 @@ async function generateIterative(inp, cfg, numStep, guidanceScale, tShift, layer
     catch (e) { log('error', `GPU prepare failed: ${e.message}`); gpuPostProc.destroy(); gpuPostProc = null; }
   }
 
-  // ── KV-mode-only pre-allocated state ────────────────────────────────────
-  // Prefix position/target_positions (step 0): arange broadcast across batch.
-  // Step-mode buffers (step 1..N-1): target-only inputs + wider attention mask
-  //   that attends to the full cached prefix. Only input_ids changes per step.
-  //
-  // In B=1 split mode (mainSessionIsKvB1), every per-step tensor exists in
-  // TWO independent (B=1) flavours — cond and uncond. The cond call sees the
-  // full prefix (S_full = maxLen); the uncond call only ever sees its own
-  // target-only window (S_full = uncondLen = numTargetTokens), which is the
-  // whole point of the split. Frozen prefix K/V is likewise stored in two
-  // independent arrays.
-  let prefixPosIds = null;
-  let stepBIds = null, stepBMask = null, stepBAttn = null;
-  let stepPosIds = null, stepTargetPos = null;
-  let prefixPastKv = null; // B=2 path only: zeros fed in for step-0 prefix call
+  // ── B=1 KV split state ──────────────────────────────────────────────────
+  // Cond sees the full prefix. Uncond only sees the target window.
+  const b1CondIds = new BigInt64Array(C * maxLen);
+  for (let c = 0; c < C; c++)
+    for (let s = 0; s < maxLen; s++)
+      b1CondIds[c * maxLen + s] = inputIds[c * totalLen + s];
+  const b1CondMask = new Uint8Array(maxLen);
+  for (let s = 0; s < maxLen; s++) b1CondMask[s] = audioMask[s];
+  const b1CondAttn = new Uint8Array(maxLen * maxLen);
+  for (let q = 0; q < maxLen; q++)
+    for (let k = 0; k < maxLen; k++)
+      b1CondAttn[q * maxLen + k] = 1;
+  const b1CondPos = new BigInt64Array(maxLen);
+  for (let s = 0; s < maxLen; s++) b1CondPos[s] = BigInt(s);
 
-  // B=1 split state. All shapes start with a leading B=1 dim.
-  let b1CondIds = null, b1CondMask = null, b1CondAttn = null, b1CondPos = null;
-  let b1UncondIds = null, b1UncondMask = null, b1UncondAttn = null, b1UncondPos = null;
-  let b1StepCondIds = null, b1StepCondAttn = null, b1StepCondPos = null, b1StepCondMask = null;
-  let b1StepUncondIds = null, b1StepUncondAttn = null, b1StepUncondPos = null, b1StepUncondMask = null;
-  let b1PrefixCondZeros = null, b1PrefixUncondZeros = null;
+  const b1UncondIds = new BigInt64Array(C * uncondLen).fill(BigInt(maskId));
+  const b1UncondMask = new Uint8Array(uncondLen).fill(1);
+  const b1UncondAttn = new Uint8Array(uncondLen * uncondLen);
+  for (let q = 0; q < uncondLen; q++)
+    for (let k = 0; k < uncondLen; k++)
+      b1UncondAttn[q * uncondLen + k] = 1;
+  const b1UncondPos = new BigInt64Array(uncondLen);
+  for (let s = 0; s < uncondLen; s++) b1UncondPos[s] = BigInt(s);
 
-  // Step-0 presents are kept alive for the rest of the loop (frozen prefix K/V).
-  // In B=2: single array of 2*KV_NUM_LAYERS tensors, each (B=2, kv_h, maxLen, d).
-  // In B=1: two independent arrays, cond (S_full=maxLen) + uncond (S_full=uncondLen).
-  let frozenPresentKv = null;
+  const b1StepCondIds = new BigInt64Array(C * numTargetTokens).fill(BigInt(maskId));
+  const b1StepCondMask = new Uint8Array(numTargetTokens).fill(1);
+  const b1StepCondAttn = new Uint8Array(numTargetTokens * maxLen);
+  for (let q = 0; q < numTargetTokens; q++)
+    for (let k = 0; k < maxLen; k++)
+      b1StepCondAttn[q * maxLen + k] = 1;
+  const b1StepCondPos = new BigInt64Array(numTargetTokens);
+  for (let t = 0; t < numTargetTokens; t++) b1StepCondPos[t] = BigInt(targetOff + t);
+
+  const b1StepUncondIds = new BigInt64Array(C * numTargetTokens).fill(BigInt(maskId));
+  const b1StepUncondMask = new Uint8Array(numTargetTokens).fill(1);
+  const b1StepUncondAttn = new Uint8Array(numTargetTokens * uncondLen);
+  for (let q = 0; q < numTargetTokens; q++)
+    for (let k = 0; k < uncondLen; k++)
+      b1StepUncondAttn[q * uncondLen + k] = 1;
+  const b1StepUncondPos = new BigInt64Array(numTargetTokens);
+  for (let t = 0; t < numTargetTokens; t++) b1StepUncondPos[t] = BigInt(t);
+
+  const b1PrefixCondZeros = {
+    zeros: new Float16Array(KV_HEADS * maxLen * KV_HEAD_DIM),
+    shape: [1, KV_HEADS, maxLen, KV_HEAD_DIM],
+  };
+  const b1PrefixUncondZeros = {
+    zeros: new Float16Array(KV_HEADS * uncondLen * KV_HEAD_DIM),
+    shape: [1, KV_HEADS, uncondLen, KV_HEAD_DIM],
+  };
+
   let frozenPresentKvCond = null, frozenPresentKvUncond = null;
-  let uncondRunsExecuted = 0;  // for the chunk-end perf log
-
-  if (mainSessionIsKv && !mainSessionIsKvB1) {
-    // ── B=2 KV path (legacy, optimization 5) ───────────────────────────────
-    prefixPosIds = new BigInt64Array(2 * maxLen);
-    for (let s = 0; s < maxLen; s++) {
-      prefixPosIds[s] = BigInt(s);
-      prefixPosIds[maxLen + s] = BigInt(s);
-    }
-
-    // Step-mode inputs: target-only (numTargetTokens along seq_new), S_full=maxLen.
-    stepBIds = new BigInt64Array(2 * C * numTargetTokens).fill(BigInt(maskId));
-    stepBMask = new Uint8Array(2 * numTargetTokens).fill(1);
-    // attention (2, 1, numTargetTokens, maxLen):
-    //   cond (b=0):  target queries attend to ALL keys   → ones
-    //   uncond (b=1):target queries attend only to keys < uncondLen (= numTargetTokens)
-    stepBAttn = new Uint8Array(2 * numTargetTokens * maxLen);
-    for (let q = 0; q < numTargetTokens; q++)
-      for (let k = 0; k < maxLen; k++)
-        stepBAttn[q * maxLen + k] = 1;
-    for (let q = 0; q < numTargetTokens; q++)
-      for (let k = 0; k < uncondLen; k++)
-        stepBAttn[numTargetTokens * maxLen + q * maxLen + k] = 1;
-
-    stepPosIds = new BigInt64Array(2 * numTargetTokens);
-    for (let t = 0; t < numTargetTokens; t++) {
-      stepPosIds[t] = BigInt(targetOff + t);
-      stepPosIds[numTargetTokens + t] = BigInt(t);
-    }
-    stepTargetPos = new BigInt64Array(stepPosIds);
-
-    const kvElems = 2 * KV_HEADS * maxLen * KV_HEAD_DIM;
-    prefixPastKv = { zeros: new Float16Array(kvElems), shape: [2, KV_HEADS, maxLen, KV_HEAD_DIM] };
-    frozenPresentKv = null;
-  } else if (mainSessionIsKvB1) {
-    // ── B=1 KV split path (optimization 8) ─────────────────────────────────
-    // Build per-side prefix (step-0) and step (step>=1) input buffers. Each
-    // one starts with a leading B=1 dim.
-
-    // Step-0 cond inputs: the full (text + ref + target-masked) sequence.
-    // Reuses bIds's cond row (already filled above) — avoid doubling memory.
-    b1CondIds = new BigInt64Array(C * maxLen);
-    for (let c = 0; c < C; c++)
-      for (let s = 0; s < maxLen; s++)
-        b1CondIds[c * maxLen + s] = bIds[c * maxLen + s];
-    b1CondMask = new Uint8Array(maxLen);
-    for (let s = 0; s < maxLen; s++) b1CondMask[s] = bMask[s];
-    b1CondAttn = new Uint8Array(maxLen * maxLen);
-    for (let q = 0; q < maxLen; q++)
-      for (let k = 0; k < maxLen; k++)
-        b1CondAttn[q * maxLen + k] = 1;
-    b1CondPos = new BigInt64Array(maxLen);
-    for (let s = 0; s < maxLen; s++) b1CondPos[s] = BigInt(s);
-
-    // Step-0 uncond inputs: target-only sequence (S = uncondLen == numTargetTokens).
-    // All audio mask tokens, full attention.
-    b1UncondIds = new BigInt64Array(C * uncondLen).fill(BigInt(maskId));
-    b1UncondMask = new Uint8Array(uncondLen).fill(1);
-    b1UncondAttn = new Uint8Array(uncondLen * uncondLen);
-    for (let q = 0; q < uncondLen; q++)
-      for (let k = 0; k < uncondLen; k++)
-        b1UncondAttn[q * uncondLen + k] = 1;
-    b1UncondPos = new BigInt64Array(uncondLen);
-    for (let s = 0; s < uncondLen; s++) b1UncondPos[s] = BigInt(s);
-
-    // Step>=1 cond inputs: S_new = numTargetTokens, S_full = maxLen.
-    b1StepCondIds = new BigInt64Array(C * numTargetTokens).fill(BigInt(maskId));
-    b1StepCondMask = new Uint8Array(numTargetTokens).fill(1);
-    b1StepCondAttn = new Uint8Array(numTargetTokens * maxLen);
-    for (let q = 0; q < numTargetTokens; q++)
-      for (let k = 0; k < maxLen; k++)
-        b1StepCondAttn[q * maxLen + k] = 1;
-    b1StepCondPos = new BigInt64Array(numTargetTokens);
-    for (let t = 0; t < numTargetTokens; t++) b1StepCondPos[t] = BigInt(targetOff + t);
-
-    // Step>=1 uncond inputs: S_new = numTargetTokens, S_full = uncondLen.
-    // Since uncondLen == numTargetTokens, the step-mode query and key counts
-    // are identical for uncond. The attention matrix is num × num.
-    b1StepUncondIds = new BigInt64Array(C * numTargetTokens).fill(BigInt(maskId));
-    b1StepUncondMask = new Uint8Array(numTargetTokens).fill(1);
-    b1StepUncondAttn = new Uint8Array(numTargetTokens * uncondLen);
-    for (let q = 0; q < numTargetTokens; q++)
-      for (let k = 0; k < uncondLen; k++)
-        b1StepUncondAttn[q * uncondLen + k] = 1;
-    b1StepUncondPos = new BigInt64Array(numTargetTokens);
-    for (let t = 0; t < numTargetTokens; t++) b1StepUncondPos[t] = BigInt(t);
-
-    // Zero past_kv buffers for step-0 call. Cond needs S_full=maxLen,
-    // uncond needs S_full=uncondLen. Each buffer is reused across all 56
-    // past_{key,value}_i inputs on its respective side.
-    b1PrefixCondZeros = {
-      zeros: new Float16Array(KV_HEADS * maxLen * KV_HEAD_DIM),
-      shape: [1, KV_HEADS, maxLen, KV_HEAD_DIM],
-    };
-    b1PrefixUncondZeros = {
-      zeros: new Float16Array(KV_HEADS * uncondLen * KV_HEAD_DIM),
-      shape: [1, KV_HEADS, uncondLen, KV_HEAD_DIM],
-    };
-
-    frozenPresentKvCond = null;
-    frozenPresentKvUncond = null;
-  }
+  let uncondRunsExecuted = 0;
 
   let totalInferenceMs = 0, totalModelMs = 0, totalPostProcMs = 0, totalSampleMs = 0;
+  let generationMainSource = activeRuntime.mainEp;
   window._abortRequested = false;
   for (let step = 0; step < numStep; step++) {
     if (window._abortRequested) {
@@ -662,34 +534,25 @@ async function generateIterative(inp, cfg, numStep, guidanceScale, tShift, layer
     }
     const k = sched[step];
     if (k <= 0) continue;
+    log('generating', `Running step ${step + 1}/${numStep}...`);
+
     const stepT0 = performance.now();
 
     const modelT0 = performance.now();
 
-    // ── Build per-step input tensors ──────────────────────────────────────
-    // Four cases now:
-    //   A) monolithic: (input_ids, audio_mask, attention_mask) single B=2 run
-    //   B) KV B=2 prefix (step 0 when mainSessionIsKv && !mainSessionIsKvB1):
-    //      B=2 inputs + position_ids + target_positions + 56 past_kv zeros
-    //   C) KV B=2 step (step 1..N-1): target-only B=2 inputs + 56 past_kv from
-    //      frozen-prefix GPU buffers saved at step 0
-    //   D) KV B=1 split (mainSessionIsKvB1): TWO separate B=1 mainSession.run
-    //      calls per step, one cond, one uncond. Each side has its own
-    //      frozen-prefix KV snapshot and its own logits output buffer.
+    // ── Build per-step B=1 split input tensors ───────────────────────────
 
     const nPos = C * numTargetTokens;
     const pred = step === 0 ? new Int32Array(nPos) : pred_buf;
     const scores = step === 0 ? new Float32Array(nPos) : scores_buf;
     if (step === 0) { pred_buf = pred; scores_buf = scores; }
 
-    if (mainSessionIsKvB1) {
-      // ── Case D: B=1 split ─────────────────────────────────────────────
+    {
       let condTensors;
       let uncondTensors;
       let condLogitsSeqLen, condLogitsTargetOff, uncondLogitsSeqLen;
 
       if (step === 0) {
-        // Cond prefix: (1, C, maxLen) inputs, S_full = maxLen, pos = [0..maxLen).
         condTensors = {
           input_ids: T('int64', b1CondIds, [1, C, maxLen]),
           audio_mask: T('bool', b1CondMask, [1, maxLen]),
@@ -701,7 +564,6 @@ async function generateIterative(inp, cfg, numStep, guidanceScale, tShift, layer
           condTensors[`past_key_${i}`] = T('float16', b1PrefixCondZeros.zeros, b1PrefixCondZeros.shape);
           condTensors[`past_value_${i}`] = T('float16', b1PrefixCondZeros.zeros, b1PrefixCondZeros.shape);
         }
-        // Uncond prefix: (1, C, uncondLen) inputs, S_full = uncondLen.
         uncondTensors = {
           input_ids: T('int64', b1UncondIds, [1, C, uncondLen]),
           audio_mask: T('bool', b1UncondMask, [1, uncondLen]),
@@ -713,15 +575,13 @@ async function generateIterative(inp, cfg, numStep, guidanceScale, tShift, layer
           uncondTensors[`past_key_${i}`] = T('float16', b1PrefixUncondZeros.zeros, b1PrefixUncondZeros.shape);
           uncondTensors[`past_value_${i}`] = T('float16', b1PrefixUncondZeros.zeros, b1PrefixUncondZeros.shape);
         }
-        condLogitsSeqLen = maxLen;   condLogitsTargetOff = targetOff;
+        condLogitsSeqLen = maxLen;
+        condLogitsTargetOff = targetOff;
         uncondLogitsSeqLen = uncondLen;
       } else {
-        // Target-mode: rebuild cond input_ids from the monolithic bIds
-        // buffer (tokens get written back to bIds at the end of every step
-        // so the builder stays simple here). Both branches run every step.
         for (let c = 0; c < C; c++) {
           for (let t = 0; t < numTargetTokens; t++) {
-            const v = bIds[c * maxLen + targetOff + t];
+            const v = tokens[c * numTargetTokens + t];
             b1StepCondIds[c * numTargetTokens + t] = v;
             b1StepUncondIds[c * numTargetTokens + t] = v;
           }
@@ -748,17 +608,11 @@ async function generateIterative(inp, cfg, numStep, guidanceScale, tShift, layer
           uncondTensors[`past_key_${i}`] = frozenPresentKvUncond[i];
           uncondTensors[`past_value_${i}`] = frozenPresentKvUncond[i + KV_NUM_LAYERS];
         }
-        condLogitsSeqLen = numTargetTokens;   condLogitsTargetOff = 0;
+        condLogitsSeqLen = numTargetTokens;
+        condLogitsTargetOff = 0;
         uncondLogitsSeqLen = numTargetTokens;
       }
 
-      // Sequential cond then uncond. ORT-web's InferenceSession
-      // is not reentrant — calling run() while another run() is still
-      // pending on the same session throws "Session already started" from
-      // the IOBinding path. The only way to actually parallelize would be
-      // to load the main model into a second sibling session, which
-      // roughly doubles VRAM for marginal wall-time gain (WebGPU's queue
-      // still serializes). Not worth it at our current perf ceiling.
       const condResults = await mainSession.run(condTensors);
       const uncondResults = await mainSession.run(uncondTensors);
       uncondRunsExecuted++;
@@ -775,8 +629,8 @@ async function generateIterative(inp, cfg, numStep, guidanceScale, tShift, layer
         condLogitsTensor.gpuBuffer &&
         uncondLogitsTensor.gpuBuffer;
 
-      // Dispose per-step input tensors we own. Past K/V at step>=1 are the
-      // frozen prefix buffers — don't dispose them here.
+      const getTensorCpu = async (tensor) => tensorData(tensor);
+
       for (const name of Object.keys(condTensors)) {
         if (step > 0 && (name.startsWith('past_key_') || name.startsWith('past_value_'))) continue;
         condTensors[name].dispose();
@@ -786,15 +640,14 @@ async function generateIterative(inp, cfg, numStep, guidanceScale, tShift, layer
         uncondTensors[name].dispose();
       }
 
-      // Save (or discard) the two sides' present_kv.
       if (step === 0) {
         frozenPresentKvCond = new Array(2 * KV_NUM_LAYERS);
         frozenPresentKvUncond = new Array(2 * KV_NUM_LAYERS);
         for (let i = 0; i < KV_NUM_LAYERS; i++) {
-          frozenPresentKvCond[i]                    = condResults[`present_key_${i}`];
-          frozenPresentKvCond[i + KV_NUM_LAYERS]    = condResults[`present_value_${i}`];
-          frozenPresentKvUncond[i]                  = uncondResults[`present_key_${i}`];
-          frozenPresentKvUncond[i + KV_NUM_LAYERS]  = uncondResults[`present_value_${i}`];
+          frozenPresentKvCond[i] = condResults[`present_key_${i}`];
+          frozenPresentKvCond[i + KV_NUM_LAYERS] = condResults[`present_value_${i}`];
+          frozenPresentKvUncond[i] = uncondResults[`present_key_${i}`];
+          frozenPresentKvUncond[i + KV_NUM_LAYERS] = uncondResults[`present_value_${i}`];
         }
         const nGpuC = frozenPresentKvCond.filter(t => t.location === 'gpu-buffer').length;
         const nGpuU = frozenPresentKvUncond.filter(t => t.location === 'gpu-buffer').length;
@@ -810,11 +663,8 @@ async function generateIterative(inp, cfg, numStep, guidanceScale, tShift, layer
 
       totalModelMs += performance.now() - modelT0;
 
-      // Post-proc: split path sets uncondBatchOff=0, per-side seq_len/off.
       const ppParams = {
         C, V, numTargetTokens, maskId, guidanceScale, layerPenalty,
-        // Legacy aliases for helpers that still read these (used only if the
-        // split path falls back to the B=2-shaped run()).
         maxLen: condLogitsSeqLen, targetOff: condLogitsTargetOff,
       };
       const ppExt = {
@@ -826,14 +676,8 @@ async function generateIterative(inp, cfg, numStep, guidanceScale, tShift, layer
       let usedGpu = false;
       if (canZeroCopy) {
         try {
-          // B=1 logits: (1, C, seq_len, V) fp16 → 2 bytes/elem, no batch prefix.
-          // (The 2 bytes at the end is bytes-per-fp16-element; the previous
-          // B=2 formula's leading `2 *` was the batch size, not a dtype factor.)
-          const condBytes   = C * condLogitsSeqLen   * V * 2;
-          const uncondBytes = C * uncondLogitsSeqLen * V * 2;
           await gpuPostProc.runGpuSplit(
             condLogitsTensor.gpuBuffer, uncondLogitsTensor.gpuBuffer,
-            condBytes, uncondBytes,
             ppParams, ppExt,
             pred, scores,
           );
@@ -843,11 +687,9 @@ async function generateIterative(inp, cfg, numStep, guidanceScale, tShift, layer
           gpuPostProc.sharedWithOrt = false;
         }
       }
-      if (!usedGpu && DIAG_FORCE_JS_POSTPROC) {
-        const condData = typeof condLogitsTensor.getData === 'function'
-          ? await condLogitsTensor.getData() : condLogitsTensor.data.slice();
-        const uncondData = typeof uncondLogitsTensor.getData === 'function'
-          ? await uncondLogitsTensor.getData() : uncondLogitsTensor.data.slice();
+      if (!usedGpu && (DIAG_FORCE_JS_POSTPROC || !gpuPostProc)) {
+        const condData = await getTensorCpu(condLogitsTensor);
+        const uncondData = await getTensorCpu(uncondLogitsTensor);
         cpuPostProcessSplit(
           condData, uncondData,
           C, condLogitsSeqLen, condLogitsTargetOff,
@@ -856,28 +698,11 @@ async function generateIterative(inp, cfg, numStep, guidanceScale, tShift, layer
           pred, scores,
         );
       } else if (!usedGpu) {
-        // CPU-staged fallback for the split path: stage both buffers and run
-        // the same shader. The `run()` helper only supports the B=2 single-
-        // buffer layout, so we splice the two fp16 arrays into one big
-        // (2, C, maxLen', V) buffer shaped like the B=2 logits tensor.
-        const condData = typeof condLogitsTensor.getData === 'function'
-          ? await condLogitsTensor.getData() : condLogitsTensor.data.slice();
-        const uncondData = typeof uncondLogitsTensor.getData === 'function'
-          ? await uncondLogitsTensor.getData() : uncondLogitsTensor.data.slice();
-        // Build a synthetic (2, C, condLogitsSeqLen, V) buffer where the
-        // uncond half is padded with -inf fp16 outside [0..uncondLogitsSeqLen).
-        // Easier: two separate cpuPostProcess passes would require reworking
-        // cpuPostProcess to take two buffers; for now, synthesize a combined
-        // layout that matches the B=2 shader addressing with condMaxLen ==
-        // uncondMaxLen == condLogitsSeqLen. We zero-pad uncond; since the
-        // CFG fusion only reads positions [0..numTargetTokens) it never
-        // touches the padding.
+        const condData = await getTensorCpu(condLogitsTensor);
+        const uncondData = await getTensorCpu(uncondLogitsTensor);
         const condElems = C * condLogitsSeqLen * V;
-        const uncondElems = C * condLogitsSeqLen * V;
-        const combined = new Uint16Array(condElems + uncondElems);
+        const combined = new Uint16Array(condElems + condElems);
         combined.set(new Uint16Array(condData.buffer, condData.byteOffset, condElems), 0);
-        // Copy uncond row-by-row (its row stride is uncondLogitsSeqLen*V, but
-        // the combined buffer allocates condLogitsSeqLen*V per row).
         const uncondSrc = new Uint16Array(uncondData.buffer, uncondData.byteOffset, C * uncondLogitsSeqLen * V);
         for (let c = 0; c < C; c++) {
           combined.set(
@@ -898,129 +723,6 @@ async function generateIterative(inp, cfg, numStep, guidanceScale, tShift, layer
 
       condLogitsTensor.dispose();
       uncondLogitsTensor.dispose();
-    } else {
-      // ── Cases A/B/C: legacy B=2 paths (monolithic / KV-B=2) ──────────────
-      let inTensors;
-      let ppLogitsSeqLen, ppCondLogitsOff;
-      if (mainSessionIsKv && step === 0) {
-        inTensors = {
-          input_ids: T('int64', bIds, [2, C, maxLen]),
-          audio_mask: T('bool', bMask, [2, maxLen]),
-          attention_mask: T('bool', bAttn, [2, 1, maxLen, maxLen]),
-          position_ids: T('int64', prefixPosIds, [2, maxLen]),
-          target_positions: T('int64', prefixPosIds.slice(), [2, maxLen]),
-        };
-        for (let i = 0; i < KV_NUM_LAYERS; i++) {
-          inTensors[`past_key_${i}`] = T('float16', prefixPastKv.zeros, prefixPastKv.shape);
-          inTensors[`past_value_${i}`] = T('float16', prefixPastKv.zeros, prefixPastKv.shape);
-        }
-        ppLogitsSeqLen = maxLen;
-        ppCondLogitsOff = targetOff;
-      } else if (mainSessionIsKv) {
-        for (let c = 0; c < C; c++) {
-          for (let t = 0; t < numTargetTokens; t++) {
-            const v = bIds[c * maxLen + targetOff + t];
-            stepBIds[c * numTargetTokens + t] = v;
-            stepBIds[(C + c) * numTargetTokens + t] = v;
-          }
-        }
-        inTensors = {
-          input_ids: T('int64', stepBIds, [2, C, numTargetTokens]),
-          audio_mask: T('bool', stepBMask, [2, numTargetTokens]),
-          attention_mask: T('bool', stepBAttn, [2, 1, numTargetTokens, maxLen]),
-          position_ids: T('int64', stepPosIds, [2, numTargetTokens]),
-          target_positions: T('int64', stepTargetPos, [2, numTargetTokens]),
-        };
-        for (let i = 0; i < KV_NUM_LAYERS; i++) {
-          inTensors[`past_key_${i}`] = frozenPresentKv[i];
-          inTensors[`past_value_${i}`] = frozenPresentKv[i + KV_NUM_LAYERS];
-        }
-        ppLogitsSeqLen = numTargetTokens;
-        ppCondLogitsOff = 0;
-      } else {
-        inTensors = {
-          input_ids: T('int64', bIds, [2, C, maxLen]),
-          audio_mask: T('bool', bMask, [2, maxLen]),
-          attention_mask: T('bool', bAttn, [2, 1, maxLen, maxLen]),
-        };
-        ppLogitsSeqLen = maxLen;
-        ppCondLogitsOff = targetOff;
-      }
-      const results = await mainSession.run(inTensors);
-
-      const logitsTensor = results.audio_logits;
-      const canZeroCopy =
-        !DIAG_FORCE_CPU_STAGED_POSTPROC &&
-        !DIAG_FORCE_JS_POSTPROC &&
-        gpuPostProc &&
-        gpuPostProc.sharedWithOrt &&
-        logitsTensor.location === 'gpu-buffer' &&
-        logitsTensor.gpuBuffer;
-
-      for (const name of Object.keys(inTensors)) {
-        if (mainSessionIsKv && step > 0 && (name.startsWith('past_key_') || name.startsWith('past_value_'))) continue;
-        inTensors[name].dispose();
-      }
-
-      if (mainSessionIsKv) {
-        if (step === 0) {
-          frozenPresentKv = new Array(2 * KV_NUM_LAYERS);
-          for (let i = 0; i < KV_NUM_LAYERS; i++) {
-            frozenPresentKv[i] = results[`present_key_${i}`];
-            frozenPresentKv[i + KV_NUM_LAYERS] = results[`present_value_${i}`];
-          }
-          const locs = frozenPresentKv.map(t => t.location);
-          const nGpu = locs.filter(l => l === 'gpu-buffer').length;
-          log('generating', `KV diag: present_* locations -> gpu-buffer=${nGpu}/${locs.length}, logits=${logitsTensor.location}, S_full=${maxLen}, S_new=${numTargetTokens}`);
-        } else {
-          for (let i = 0; i < KV_NUM_LAYERS; i++) {
-            results[`present_key_${i}`].dispose();
-            results[`present_value_${i}`].dispose();
-          }
-        }
-      }
-
-      totalModelMs += performance.now() - modelT0;
-
-      const ppParams = {
-        C, V, numTargetTokens, maskId, guidanceScale, layerPenalty,
-        maxLen: ppLogitsSeqLen, targetOff: ppCondLogitsOff,
-      };
-
-      const postProcT0 = performance.now();
-      let logitsCpu = null;
-      let usedGpu = false;
-      if (canZeroCopy) {
-        try {
-          await gpuPostProc.runGpu(logitsTensor.gpuBuffer, ppParams, pred, scores);
-          usedGpu = true;
-        } catch (e) {
-          log('warning', `Zero-copy post-proc failed (${e.message}); disabling and falling back to CPU-staged logits.`);
-          gpuPostProc.sharedWithOrt = false;
-        }
-      }
-      if (!usedGpu) {
-        if (typeof logitsTensor.getData === 'function') {
-          logitsCpu = await logitsTensor.getData();
-        } else {
-          logitsCpu = logitsTensor.data.slice();
-        }
-        if (DIAG_FORCE_JS_POSTPROC || !gpuPostProc) {
-          cpuPostProcess(logitsCpu, C, ppLogitsSeqLen, V, numTargetTokens, ppCondLogitsOff, maskId, guidanceScale, layerPenalty, pred, scores);
-        } else if (gpuPostProc) {
-          await gpuPostProc.run(logitsCpu, ppParams, pred, scores);
-        }
-      }
-      totalPostProcMs += performance.now() - postProcT0;
-
-      if (step === 0) {
-        let nz = 0;
-        for (let i = 0; i < Math.min(64, pred.length); i++) if (pred[i] !== 0) nz++;
-        const ppPath = usedGpu ? 'gpu-zero-copy' : (DIAG_FORCE_JS_POSTPROC ? 'js-cpu' : 'cpu-staged');
-        log('generating', `Post-proc check: path=${ppPath} mode=${mainSessionIsKv ? 'kv' : 'mono'} pred[0..9]=[${Array.from(pred.slice(0, 10)).join(',')}] nonzero_in_first_64=${nz}`);
-      }
-
-      logitsTensor.dispose();
     }
 
     const sampleT0 = performance.now();
@@ -1038,16 +740,6 @@ async function generateIterative(inp, cfg, numStep, guidanceScale, tShift, layer
 
     topKUnmask(scores, pred, tokens, nPos, k);
 
-    // Update batch inputs. We always mirror new target tokens back into
-    // the monolithic `bIds` layout (even in KV mode) so the step-mode
-    // input_ids builder at the top of the next iteration can read them
-    // uniformly.
-    for (let c = 0; c < C; c++)
-      for (let t = 0; t < numTargetTokens; t++) {
-        const v = tokens[c * numTargetTokens + t];
-        bIds[c * maxLen + targetOff + t] = v;
-        bIds[(C + c) * maxLen + t] = v;
-      }
     totalSampleMs += performance.now() - sampleT0;
 
     const stepMs = performance.now() - stepT0;
@@ -1060,13 +752,7 @@ async function generateIterative(inp, cfg, numStep, guidanceScale, tShift, layer
   }
 
   // Release frozen-prefix GPU buffers now that the loop is done. Without this
-  // each utterance would leak ~1.1 GB of VRAM in B=2 mode (28 layers × 2 ×
-  // 2B × 8 × maxLen × 128); in B=1 split mode we leak ~700 MB cond + ~300 MB
-  // uncond (uncond's S_full is smaller).
-  if (frozenPresentKv) {
-    for (const t of frozenPresentKv) { try { t.dispose(); } catch (_e) {} }
-    frozenPresentKv = null;
-  }
+  // each utterance would leak hundreds of MB of VRAM per side.
   if (frozenPresentKvCond) {
     for (const t of frozenPresentKvCond) { try { t.dispose(); } catch (_e) {} }
     frozenPresentKvCond = null;
@@ -1076,14 +762,8 @@ async function generateIterative(inp, cfg, numStep, guidanceScale, tShift, layer
     frozenPresentKvUncond = null;
   }
 
-  const modeLabel = mainSessionIsKvB1
-    ? 'kv-b1-split'
-    : (mainSessionIsKv ? 'kv-cached' : 'monolithic');
-  const uncondSuffix = mainSessionIsKvB1
-    ? ` | uncond runs: ${uncondRunsExecuted}/${numStep}`
-    : '';
   const otherMs = Math.max(0, totalInferenceMs - totalModelMs - totalPostProcMs - totalSampleMs);
-  log('perf', `${numStep} steps in ${totalInferenceMs.toFixed(0)}ms total | model: ${totalModelMs.toFixed(0)}ms (${(totalModelMs / Math.max(1, numStep)).toFixed(0)}ms/step) | postproc+sync: ${totalPostProcMs.toFixed(0)}ms | sample: ${totalSampleMs.toFixed(0)}ms | other: ${otherMs.toFixed(0)}ms | mode: ${modeLabel} | variant: ${mainSessionVariant}${uncondSuffix}`);
+  log('perf', `${numStep} steps in ${totalInferenceMs.toFixed(0)}ms total | model: ${totalModelMs.toFixed(0)}ms (${(totalModelMs / Math.max(1, numStep)).toFixed(0)}ms/step) | postproc+sync: ${totalPostProcMs.toFixed(0)}ms | sample: ${totalSampleMs.toFixed(0)}ms | other: ${otherMs.toFixed(0)}ms | mode: kv-b1-split | variant: ${mainSessionVariant} | main: ${generationMainSource} | uncond runs: ${uncondRunsExecuted}/${numStep}`);
 
   return tokens;
 }
@@ -1095,16 +775,17 @@ async function decodeTokens(tokens, C, T) {
   const codes = new BigInt64Array(C * T);
   codes.set(tokens);
   const inTensor = new ort.Tensor('int64', codes, [1, C, T]);
-  const r = await decoderSession.run({ audio_codes: inTensor });
-  let outData;
-  if (typeof r.audio_values.getData === 'function') {
-    outData = await r.audio_values.getData();
-  } else {
-    outData = r.audio_values.data;
+  let result = null;
+  try {
+    result = await decoderSession.run({ audio_codes: inTensor });
+    if (typeof result.audio_values.getData === 'function') {
+      return await result.audio_values.getData();
+    }
+    return result.audio_values.data;
+  } finally {
+    inTensor.dispose();
+    if (result?.audio_values) result.audio_values.dispose();
   }
-  inTensor.dispose();
-  r.audio_values.dispose();
-  return outData;
 }
 
 function audioTokensToRows(tokens, C, T) {
@@ -1147,18 +828,61 @@ async function encodeRefAudio(pcmF32) {
   return refAudioTokens;
 }
 
+async function ensureEncoderSession() {
+  if (encoderSession) return encoderSession;
+
+  log('downloading', 'Downloading encoder.onnx (654MB)...');
+  try {
+    const encResp = await fetch(`${window._modelBaseUrl}/omnivoice-encoder-fixed.onnx`);
+    if (!encResp.ok) throw new Error(`fetch status ${encResp.status}`);
+    const encBuf = await encResp.arrayBuffer();
+    const encData = new Uint8Array(encBuf);
+
+    if (activeRuntime.encoderEp === 'wasm') {
+      log('loading', 'Creating encoder session (WASM)...');
+      encoderSession = await ort.InferenceSession.create(encData, {
+        executionProviders: ['wasm'],
+        enableMemPattern: false,
+        enableCpuMemArena: false,
+      });
+      log('init', 'Encoder loaded on WASM.');
+      return encoderSession;
+    }
+
+    try {
+      log('loading', 'Creating encoder session (WebGPU)...');
+      encoderSession = await ort.InferenceSession.create(encData, {
+        executionProviders: ['webgpu'],
+        enableMemPattern: false,
+        enableCpuMemArena: false,
+      });
+      log('init', 'Encoder loaded on WebGPU.');
+    } catch (e) {
+      log('warning', `Encoder WebGPU session failed (${errorDetail(e)}); falling back to WASM.`);
+      encoderSession = await ort.InferenceSession.create(encData, {
+        executionProviders: ['wasm'],
+        enableMemPattern: false,
+        enableCpuMemArena: false,
+      });
+      log('init', 'Encoder loaded on WASM (fallback).');
+    }
+    return encoderSession;
+  } catch (e) {
+    log('error', `Failed to load encoder: ${errorDetail(e)}`);
+    throw e;
+  }
+}
+
 // ─── Init — load models and tokenizer ───────────────────────────────────────
 
 async function init(modelBaseUrl = DEFAULT_MODEL_BASE_URL) {
   try {
-    // Detect WebGPU. We do NOT pre-create a device — ORT Web 1.20 creates its
-    // own internal GPUDevice when the first WebGPU session is built, and on
-    // this build it silently ignores a preset ort.env.webgpu.device. Binding
-    // ORT's output GPU buffer into a pipeline on a *different* device is a
-    // WebGPU validation error ("Buffer … cannot be used with [Device]").
-    // Instead we create the session first, then grab ort.env.webgpu.device
-    // and hand that same device to GpuPostProcessor so cross-device binding
-    // never happens.
+    activeRuntime = {
+      mainEp: 'webgpu',
+      decoderEp: 'webgpu',
+      encoderEp: 'webgpu',
+    };
+
     let hasWorkingGPU = false;
     if (typeof navigator !== 'undefined' && navigator.gpu) {
       try {
@@ -1168,16 +892,16 @@ async function init(modelBaseUrl = DEFAULT_MODEL_BASE_URL) {
           try {
             const info = adapter.info || (adapter.requestAdapterInfo ? await adapter.requestAdapterInfo() : {});
             log('init', `WebGPU adapter: ${info.vendor || '?'} ${info.device || '?'} (${info.description || '?'})`);
-          } catch (e) {
+          } catch (_e) {
             log('init', 'WebGPU adapter found (could not read info)');
           }
         }
       } catch (e) {
-        log('init', `WebGPU probe failed: ${e.message}`);
+        log('init', `WebGPU probe failed: ${errorDetail(e)}`);
       }
     }
     if (!hasWorkingGPU) {
-      log('init', 'No WebGPU — will use WASM fallback (slower)');
+      throw new Error('WebGPU is not available. This bridge now targets the AMD BC-250 WebGPU/Vulkan runtime only.');
     }
 
     // Provide modelBaseUrl for lazy loading
@@ -1185,7 +909,7 @@ async function init(modelBaseUrl = DEFAULT_MODEL_BASE_URL) {
 
     // Load config
     log('loading', 'Loading config...');
-    config = await (await fetch(`${modelBaseUrl}/omnivoice-config.json`)).json();
+    config = await fetchJsonChecked(`${modelBaseUrl}/omnivoice-config.json`, 'omnivoice-config.json');
     log('loading', `Config loaded: ${config.num_audio_codebook} codebooks, vocab ${config.audio_vocab_size}, sr ${config.sampling_rate}`);
 
     // Load tokenizer
@@ -1197,16 +921,12 @@ async function init(modelBaseUrl = DEFAULT_MODEL_BASE_URL) {
 
     const mainModelFile = MAIN_MODEL_FILE;
     const manifestFile = MAIN_MODEL_MANIFEST;
-    mainSessionIsKv = true;
-    mainSessionIsKvB1 = true;
     mainSessionVariant = MAIN_MODEL_VARIANT;
-
     log('loading', `Using production main-model variant: ${mainSessionVariant}.`);
 
     // Load model data shards
     log('downloading', `Loading main model shards into memory (${manifestFile})...`);
-    const dataFiles = await (await fetch(`${modelBaseUrl}/${manifestFile}`)).json();
-
+    const dataFiles = await fetchJsonChecked(`${modelBaseUrl}/${manifestFile}`, manifestFile);
     let externalData = [];
     for (let i = 0; i < dataFiles.length; i++) {
       const fname = dataFiles[i];
@@ -1220,50 +940,35 @@ async function init(modelBaseUrl = DEFAULT_MODEL_BASE_URL) {
     }
 
     // Create ONNX sessions
-    let actualBackend = 'cpu';
+    let actualBackend = 'webgpu';
     log('loading', 'Creating main model session (WebGPU)...');
 
-    // We strictly ban contiguous pool arenas to save gigabytes of shared RAM VRAM.
-    // preferredOutputLocation keeps `audio_logits` on the GPU as a GPUBuffer so
-    // our GpuPostProcessor can bind it directly — no 25 MB GPU→CPU→GPU bounce
-    // per diffusion step. This is safe only if we can then access ORT's
-    // internal device to share it with GpuPostProcessor (see below).
-    // In KV mode we also keep every present_key_i / present_value_i on the GPU
-    // so the step-0 prefix call's frozen-prefix buffers never transit CPU.
-    const outLoc = {};
-    if (!DIAG_FORCE_CPU_STAGED_POSTPROC && !DIAG_FORCE_JS_POSTPROC) {
-      outLoc.audio_logits = 'gpu-buffer';
-    }
-    if (mainSessionIsKv) {
-      if (!DIAG_FORCE_CPU_KV_CACHE) {
-        for (let i = 0; i < KV_NUM_LAYERS; i++) {
-          outLoc[`present_key_${i}`] = 'gpu-buffer';
-          outLoc[`present_value_${i}`] = 'gpu-buffer';
-        }
-      }
-    }
     const opt = {
       externalData: externalData,
       graphOptimizationLevel: 'all',
       enableMemPattern: false,
       enableCpuMemArena: false,
-      preferredOutputLocation: outLoc,
+      executionProviders: ['webgpu'],
+      preferredOutputLocation: {},
     };
-
-    if (!hasWorkingGPU) {
-      throw new Error("WebGPU is not available. The program requires WebGPU to run.");
+    if (!DIAG_FORCE_CPU_STAGED_POSTPROC && !DIAG_FORCE_JS_POSTPROC) {
+      opt.preferredOutputLocation = { audio_logits: 'gpu-buffer' };
+    }
+    if (!DIAG_FORCE_CPU_KV_CACHE) {
+      for (let i = 0; i < KV_NUM_LAYERS; i++) {
+        opt.preferredOutputLocation[`present_key_${i}`] = 'gpu-buffer';
+        opt.preferredOutputLocation[`present_value_${i}`] = 'gpu-buffer';
+      }
     }
 
     try {
-      opt.executionProviders = ['webgpu'];
       mainSession = await ort.InferenceSession.create(`${modelBaseUrl}/${mainModelFile}`, opt);
-      actualBackend = 'webgpu';
     } catch (e) {
-      log('error', `Main model WebGPU failed: ${e.message}`);
-      throw new Error(`WebGPU InferenceSession creation failed: ${e.message}`);
+      log('error', `Main model WebGPU failed: ${errorDetail(e)}`);
+      throw new Error(`WebGPU InferenceSession creation failed: ${e.message || String(e)}`);
     }
 
-    // CRITICAL: Free the 2.5GB of JavaScript ArrayBuffers so the browser doesn't swap + lock up!
+    // CRITICAL: Free the JavaScript ArrayBuffers so the browser doesn't swap + lock up!
     log('loading', 'Freeing JS shard memory buffers...');
     externalData = null;
     opt.externalData = null;
@@ -1285,149 +990,59 @@ async function init(modelBaseUrl = DEFAULT_MODEL_BASE_URL) {
 
       gpuPostProc = new GpuPostProcessor(ortDevice);
       await gpuPostProc.init();
-      const diagFlags = [
-        DIAG_FORCE_CPU_STAGED_POSTPROC ? 'cpu-staged-postproc' : null,
-        DIAG_FORCE_JS_POSTPROC ? 'js-postproc' : null,
-        DIAG_FORCE_WASM_DECODER ? 'wasm-decoder' : null,
-        DIAG_FORCE_CPU_KV_CACHE ? 'cpu-kv-cache' : null,
-      ].filter(Boolean).join(', ') || 'none';
-      log('init', `Initialized GpuPostProcessor (zero-copy logits: ${ortDevice ? 'on' : 'off — ORT device not accessible'}; diagnostics: ${diagFlags})`);
+      log('init', `Initialized GpuPostProcessor (zero-copy logits: ${ortDevice ? 'on' : 'off - ORT device not accessible'})`);
     }
 
-    // Decoder on WebGPU. Historically this was pinned to WASM because the stock
-    // Encodec decoder produced heavily-quantized/silent audio. The actual cause
-    // was not a Vulkan driver bug — it was ORT-Web WebGPU EP issues:
-    //   1. `output_padding` on ConvTranspose is silently dropped.
-    //   2. ConvTranspose(k=6, s=3, pads=[2,2]) (block.4/conv_t1) produces
-    //      ~half-magnitude output regardless of input size.
-    //   3. ORT-Web 1.24+ regressed the early per-codebook Gather/MatMul
-    //      projection stack, causing intelligible-but-corrupted audio.
-    // These are worked around at the graph level by `decoder_fix_output_padding.py`
-    // and `decoder_fuse_codebook_project.py` in decoder_webgpu_fix/, which write
-    // `omnivoice-decoder-webgpu.onnx` next to the stock decoder with equivalent
-    // replacements. Verified against the CPU reference by `decoder_gpu_bisect.py`.
-    // We try the patched model on WebGPU first and transparently fall back to the
-    // stock decoder on WASM if either the file or the WebGPU session can't be built.
-    let decEp = ['webgpu'];
-    let decoderLoaded = false;
-    try {
-      if (DIAG_FORCE_WASM_DECODER) throw new Error('DIAG_FORCE_WASM_DECODER=true');
-      log('loading', 'Trying WebGPU-patched decoder (omnivoice-decoder-webgpu.onnx, ~111MB)...');
-      const decResp = await fetch(`${modelBaseUrl}/omnivoice-decoder-webgpu.onnx`);
-      if (!decResp.ok) throw new Error(`fetch status ${decResp.status}`);
-      const decBuf = await decResp.arrayBuffer();
-      decoderSession = await ort.InferenceSession.create(new Uint8Array(decBuf), { executionProviders: decEp, enableMemPattern: false, enableCpuMemArena: false });
-      decoderLoaded = true;
-      log('loading', 'Decoder session created on WebGPU.');
-    } catch (e) {
-      log('loading', `WebGPU-patched decoder unavailable (${e.message}) — falling back to stock decoder on WASM.`);
-    }
-    if (!decoderLoaded) {
-      decEp = ['wasm'];
-      log('loading', 'Downloading omnivoice-decoder.onnx (~87MB)...');
-      try {
-        const decResp = await fetch(`${modelBaseUrl}/omnivoice-decoder.onnx`);
-        const decBuf = await decResp.arrayBuffer();
-        log('loading', 'Creating decoder session (wasm)...');
-        decoderSession = await ort.InferenceSession.create(new Uint8Array(decBuf), { executionProviders: decEp, enableMemPattern: false, enableCpuMemArena: false });
-      } catch (e) {
-        log('error', `Failed to load decoder: ${e.message}`);
-        throw e;
+    const loadDecoderWasm = async () => {
+      log('loading', 'Downloading decoder for WASM...');
+      let decName = 'omnivoice-decoder-webgpu.onnx';
+      let decResp = await fetch(`${modelBaseUrl}/${decName}`);
+      if (!decResp.ok) {
+        decName = 'omnivoice-decoder.onnx';
+        decResp = await fetch(`${modelBaseUrl}/${decName}`);
       }
-    }
-    window._decEp = decEp;
+      if (!decResp.ok) throw new Error(`fetch ${decName} failed: ${decResp.status}`);
+      const decBuf = await decResp.arrayBuffer();
+      decoderSession = await ort.InferenceSession.create(new Uint8Array(decBuf), {
+        executionProviders: ['wasm'],
+        enableMemPattern: false,
+        enableCpuMemArena: false,
+      });
+      decoderSessionInfo = { ep: 'wasm', model: decName, bytes: decBuf.byteLength };
+    };
 
-    // Pre-load encoder for voice cloning (654MB). The encoder was previously
-    // pinned to WASM out of caution, but bisection (encoder_webgpu_fix/) shows
-    // the stock graph runs bit-accurately on the ORT-Web WebGPU EP on BC-250:
-    //   - audio_codes matches CPU exactly at every tested input size
-    //   - no op (Conv, LayerNorm, InstanceNorm, Softmax, MatMul, ArgMax)
-    //     diverges beyond normal fp32 noise (rel_l2 < 1e-5)
-    // Running on WebGPU is ~4x faster than WASM on this hardware, so we try
-    // WebGPU first and transparently fall back to WASM if session creation
-    // fails for any reason (e.g. an older driver that rejects the model).
-    log('downloading', 'Downloading encoder.onnx (654MB)...');
-    try {
-      const encResp = await fetch(`${modelBaseUrl}/omnivoice-encoder-fixed.onnx`);
-      const encBuf = await encResp.arrayBuffer();
-      const encData = new Uint8Array(encBuf);
+    if (activeRuntime.decoderEp === 'wasm') {
+      await loadDecoderWasm();
+      log('loading', `Decoder session created on WASM (${decoderSessionInfo.model}).`);
+    } else {
       try {
-        log('loading', 'Creating encoder session (WebGPU)...');
-        encoderSession = await ort.InferenceSession.create(encData, {
+        if (DIAG_FORCE_WASM_DECODER) throw new Error('DIAG_FORCE_WASM_DECODER=true');
+        log('loading', 'Trying WebGPU-patched decoder (omnivoice-decoder-webgpu.onnx, ~111MB)...');
+        const decResp = await fetch(`${modelBaseUrl}/omnivoice-decoder-webgpu.onnx`);
+        if (!decResp.ok) throw new Error(`fetch status ${decResp.status}`);
+        const decBuf = await decResp.arrayBuffer();
+        decoderSession = await ort.InferenceSession.create(new Uint8Array(decBuf), {
           executionProviders: ['webgpu'],
           enableMemPattern: false,
           enableCpuMemArena: false,
         });
-        window._encEp = 'webgpu';
-        log('init', 'Encoder pre-loaded on WebGPU.');
+        decoderSessionInfo = { ep: 'webgpu', model: 'omnivoice-decoder-webgpu.onnx', bytes: decBuf.byteLength };
+        log('loading', 'Decoder session created on WebGPU.');
       } catch (e) {
-        log('warning', `Encoder WebGPU session failed (${e.message}); falling back to WASM.`);
-        encoderSession = await ort.InferenceSession.create(encData, {
-          executionProviders: ['wasm'],
-          enableMemPattern: false,
-          enableCpuMemArena: false,
-        });
-        window._encEp = 'wasm';
-        log('init', 'Encoder pre-loaded on WASM (fallback).');
+        log('loading', `WebGPU decoder unavailable (${errorDetail(e)}); falling back to WASM.`);
+        await loadDecoderWasm();
       }
-      window._hasEncoderWarmedUp = true;
-    } catch (e) {
-      log('error', `Failed to pre-load encoder: ${e.message}`);
     }
-
-    // Warm up sessions
-    log('loading', 'Warming up sessions...');
     try {
-      if (mainSessionIsKv) {
-        // KV graph: build dummy prefix-style call (S_new == S_full == 4).
-        // The batch dim differs between B=1 and B=2 graphs; everything else is
-        // identical (the trace uses dynamic axes so the graph accepts either).
-        const B = mainSessionIsKvB1 ? 1 : 2;
-        const S = 4;
-        const dummyIds = new BigInt64Array(B * 8 * S).fill(1024n);
-        const dummyMask = new Uint8Array(B * S);
-        const dummyAttn = new Uint8Array(B * 1 * S * S).fill(1);
-        const dummyPos = new BigInt64Array(B * S);
-        for (let b = 0; b < B; b++) for (let s = 0; s < S; s++) dummyPos[b * S + s] = BigInt(s);
-        const feed = {
-          input_ids: new ort.Tensor('int64', dummyIds, [B, 8, S]),
-          audio_mask: new ort.Tensor('bool', dummyMask, [B, S]),
-          attention_mask: new ort.Tensor('bool', dummyAttn, [B, 1, S, S]),
-          position_ids: new ort.Tensor('int64', dummyPos, [B, S]),
-          target_positions: new ort.Tensor('int64', dummyPos.slice(), [B, S]),
-        };
-        const kvSize = B * KV_HEADS * S * KV_HEAD_DIM;
-        for (let i = 0; i < KV_NUM_LAYERS; i++) {
-          feed[`past_key_${i}`] = new ort.Tensor('float16', new Float16Array(kvSize), [B, KV_HEADS, S, KV_HEAD_DIM]);
-          feed[`past_value_${i}`] = new ort.Tensor('float16', new Float16Array(kvSize), [B, KV_HEADS, S, KV_HEAD_DIM]);
-        }
-        const warm = await mainSession.run(feed);
-        for (const k in warm) warm[k].dispose();
-        for (const k in feed) feed[k].dispose();
-      } else {
-        const dummyIds = new BigInt64Array(2 * 8 * 4).fill(1024n);
-        const dummyMask = new Uint8Array(2 * 4);
-        const dummyAttn = new Uint8Array(2 * 1 * 4 * 4).fill(1);
-        await mainSession.run({
-          input_ids: new ort.Tensor('int64', dummyIds, [2, 8, 4]),
-          audio_mask: new ort.Tensor('bool', dummyMask, [2, 4]),
-          attention_mask: new ort.Tensor('bool', dummyAttn, [2, 1, 4, 4]),
-        });
-      }
-      const dummyCodes = new BigInt64Array(8 * 2).fill(0n);
-      await decoderSession.run({ audio_codes: new ort.Tensor('int64', dummyCodes, [1, 8, 2]) });
-      if (window._hasEncoderWarmedUp) {
-        const dummyAudio = new Float32Array(960);
-        await encoderSession.run({ input_values: new ort.Tensor('float32', dummyAudio, [1, 1, 960]) });
-      }
-    } catch (e) {
-      log('init', `Warm-up error (non-fatal): ${e.message}`);
+      await ensureEncoderSession();
+    } catch (_e) {
+      log('warning', 'Encoder pre-load failed; voice cloning will retry when reference audio is used.');
     }
 
     log('ready', `Engine ready. Backend: ${actualBackend}`);
-    return { backend: actualBackend, config };
+    return { backend: actualBackend, config, model: { repoId: DEFAULT_MODEL_REPO_ID, mainVariant: MAIN_MODEL_VARIANT } };
   } catch (err) {
-    log('error', `Init failed: ${err.message}\n${err.stack}`);
+    log('error', `Init failed: ${errorDetail(err)}`);
     throw err;
   }
 }
@@ -1441,7 +1056,6 @@ async function synthesize(params) {
     seed = null, denoise = true, precalculatedRefTokens = null,
     returnAudioTokens = false
   } = params;
-
   try {
     // Use seeded PRNG for deterministic output when seed is provided
     rng = seed != null ? mulberry32(seed) : Math.random;
@@ -1475,9 +1089,7 @@ async function synthesize(params) {
         log('encoding', `Transcribed reference text: "${autoRefText}"`);
       }
 
-      if (!encoderSession) {
-        throw new Error('Encoder session not loaded. Check init() logs.');
-      }
+      await ensureEncoderSession();
       const pcmF32 = new Float32Array(refAudio);
       refAudioTokens = await encodeRefAudio(pcmF32);
     }
@@ -1494,10 +1106,6 @@ async function synthesize(params) {
     });
 
     const tokens = await generateIterative(inputs, config, numStep, guidanceScale, tShift);
-
-    // DEBUG: print first 20 tokens to see if they unmasked properly
-    log('decoding', `First 20 tokens (cb0): [${Array.from(tokens.slice(0, 20)).join(', ')}]`);
-
     const pcm = await decodeTokens(tokens, config.num_audio_codebook, numTargetTokens);
 
     log('done', `Generated ${pcm.length} samples (${(pcm.length / config.sampling_rate).toFixed(1)}s at ${config.sampling_rate}Hz)`);
@@ -1527,7 +1135,7 @@ async function synthesize(params) {
       ...metadata,
     };
   } catch (err) {
-    log('error', `Synthesis failed: ${err.message}\n${err.stack}`);
+    log('error', `Synthesis failed: ${errorDetail(err)}`);
     throw err;
   }
 }
@@ -1560,7 +1168,7 @@ async function generateVoiceData(pcmF32, hint) {
   }
 
   if (!encoderSession) {
-    throw new Error('Encoder session not loaded. Cannot precalculate tokens.');
+    await ensureEncoderSession();
   }
 
   const refAudioTokens = await encodeRefAudio(pcmF32);
@@ -1607,30 +1215,15 @@ log('boot', 'TTS engine module loaded, waiting for init()...');/**
 //   u32_idx = fp16_idx >> 1,   lane = fp16_idx & 1
 //   lane==0 → unpack2x16float(packed).x   (low 16 bits)
 //   lane==1 → unpack2x16float(packed).y   (high 16 bits)
-// The shader takes TWO logits storage bindings (cond + uncond) and per-side
-// stride parameters. This single WGSL serves both:
-//
-//   1. B=2 monolithic / B=2 KV: both bindings point to the same packed
-//      (2, C, maxLen, V) logits buffer. Cond addressing starts at 0; uncond
-//      addressing starts at C*maxLen*V (via `uncondBatchOff`).
-//   2. B=1 KV split: bindings point to two independent
-//      (1, C, S_cond, V) and (1, C, S_uncond, V) logits buffers from two
-//      separate mainSession.run() calls per step. `uncondBatchOff` is 0.
-//
-// Keeping one shader means zero extra pipeline state to manage. The B=2 path
-// ends up doing redundant identical fp16 loads via the two bindings, but the
-// L1 cache absorbs this — there's no measurable penalty vs the previous
-// one-binding version.
+// The shader takes two logits storage bindings. The zero-copy path binds the
+// independent cond/uncond ORT GPU buffers; the CPU-staged fallback packs those
+// streams into a single staging buffer and binds it twice with an offset.
 const WGSL = /* wgsl */ `
 
 // CFG + argmax post-processing shader.
 // Input:  cond/uncond logits buffers (fp16, packed as u32 pairs).
 // Output: pred[nPos]   — argmax vocab id per position
 //         scoresBuf[nPos] — log-prob of that argmax minus codebook penalty
-//
-// The monolithic (B=2) and split (B=1) zero-copy paths both use this shader;
-// they differ only in how they set up the cond/uncond bindings and the
-// uncondBatchOff param.
 
 struct Params {
   C:               u32,  // num codebooks (8)
@@ -1642,9 +1235,8 @@ struct Params {
   uncondMaxLen:    u32,  // uncond logits seq-dim
   uncondTargetOff: u32,  // offset into uncond seq-dim where target region begins
   uncondBatchOff:  u32,  // additional offset (in units of seq_len*V) prepended
-                         //   to every uncond index. Used in the B=2 path to
-                         //   skip past the cond rows in the shared buffer
-                         //   (= C * maxLen). Zero in the B=1 split path.
+                         //   to every uncond index when cond/uncond share a
+                         //   CPU-staged buffer. Zero-copy split uses 0.
   guidanceScale:   f32,
   layerPenalty:    f32,
 };
@@ -1684,34 +1276,22 @@ fn main(@builtin(global_invocation_id) gid : vec3u) {
   let NEG_INF : f32 = -1.0e30;
   let gScale1 = 1.0 + p.guidanceScale;
 
-  var cMax : f32 = NEG_INF;
-  for (var v : u32 = 0u; v < V; v = v + 1u) {
-    cMax = max(cMax, load_fp16_cond(cBase + v));
-  }
-  var cSum : f32 = 0.0;
-  for (var v : u32 = 0u; v < V; v = v + 1u) {
-    cSum = cSum + exp(load_fp16_cond(cBase + v) - cMax);
-  }
-  let cLse = cMax + log(cSum);
-
-  var uMax : f32 = NEG_INF;
-  for (var v : u32 = 0u; v < V; v = v + 1u) {
-    uMax = max(uMax, load_fp16_uncond(uBase + v));
-  }
-  var uSum : f32 = 0.0;
-  for (var v : u32 = 0u; v < V; v = v + 1u) {
-    uSum = uSum + exp(load_fp16_uncond(uBase + v) - uMax);
-  }
-  let uLse = uMax + log(uSum);
-
+  // The old shader did log_softmax(cond) and log_softmax(uncond) separately:
+  //
+  //   gv = (1+s) * (c - c_lse) - s * (u - u_lse)
+  //
+  // The c_lse/u_lse part is constant over vocab and cancels when the final
+  // softmax normalizes gv. So the exact same pred and scores come from the
+  // fused raw logits r = (1+s)*c - s*u. This removes four full exp/log passes
+  // per position, which matters on the BC-250 WebGPU/Vulkan path.
   var gMax : f32 = NEG_INF;
   for (var v : u32 = 0u; v < V; v = v + 1u) {
-    let gv = gScale1 * (load_fp16_cond(cBase + v) - cLse) - p.guidanceScale * (load_fp16_uncond(uBase + v) - uLse);
+    let gv = gScale1 * load_fp16_cond(cBase + v) - p.guidanceScale * load_fp16_uncond(uBase + v);
     gMax = max(gMax, gv);
   }
   var gSum : f32 = 0.0;
   for (var v : u32 = 0u; v < V; v = v + 1u) {
-    let gv = gScale1 * (load_fp16_cond(cBase + v) - cLse) - p.guidanceScale * (load_fp16_uncond(uBase + v) - uLse);
+    let gv = gScale1 * load_fp16_cond(cBase + v) - p.guidanceScale * load_fp16_uncond(uBase + v);
     gSum = gSum + exp(gv - gMax);
   }
   let gLse = gMax + log(gSum);
@@ -1720,7 +1300,7 @@ fn main(@builtin(global_invocation_id) gid : vec3u) {
   var bestS : f32 = NEG_INF;
   for (var v : u32 = 0u; v < V; v = v + 1u) {
     if (v == p.maskId) { continue; }
-    let gv = gScale1 * (load_fp16_cond(cBase + v) - cLse) - p.guidanceScale * (load_fp16_uncond(uBase + v) - uLse);
+    let gv = gScale1 * load_fp16_cond(cBase + v) - p.guidanceScale * load_fp16_uncond(uBase + v);
     let lp = gv - gLse;
     if (lp > bestS) { bestS = lp; bestV = v; }
   }
@@ -1737,7 +1317,7 @@ class GpuPostProcessor {
     this.sharedWithOrt = !!device; // consumers check this before attempting zero-copy
     this.pipeline = null;
     this.bindGroupLayout = null;
-    this.logitsBuf = null;        // only allocated in the legacy CPU-staged path
+    this.logitsBuf = null;        // only allocated in the CPU-staged fallback
     this.paramsBuf = null;
     this.predBuf = null;
     this.scoresBuf = null;
@@ -1803,12 +1383,9 @@ class GpuPostProcessor {
     });
   }
 
-  // Serialize the 12-entry Params struct into the paramsBuf. `ext` carries
-  // the new split-aware fields; unsupplied fields fall back to B=2 defaults
-  // derived from the legacy `params` object so old callers work untouched.
+  // Serialize the 12-entry Params struct into the paramsBuf.
   _writeParams(params, ext) {
     const { C, V, numTargetTokens, maskId, guidanceScale, layerPenalty } = params;
-    // Legacy params used `maxLen` (cond seq-dim) + `targetOff` (cond off).
     const condMaxLen = ext.condMaxLen ?? params.maxLen;
     const condTargetOff = ext.condTargetOff ?? params.targetOff;
     const uncondMaxLen = ext.uncondMaxLen ?? params.maxLen;
@@ -1834,8 +1411,8 @@ class GpuPostProcessor {
   }
 
   /** Grow pred/scores output buffers for a new synthesis run. The logits
-   *  staging buffer is only needed on the CPU-staged legacy path and is
-   *  allocated lazily in run().
+    *  staging buffer is only needed on the CPU-staged fallback and is allocated
+    *  lazily in run().
    */
   prepare(C, maxLen, V, numTargetTokens) {
     const dev = this.device;
@@ -1880,73 +1457,16 @@ class GpuPostProcessor {
   }
 
   /**
-   * Zero-copy path, B=2 mode: ORT owns a single packed (2, C, maxLen, V)
-   * logits GPU buffer; we bind it to both cond AND uncond bindings and rely
-   * on `uncondBatchOff = C*maxLen` to skip into the uncond rows. Caller must
-   * not dispose the ORT tensor until this promise resolves.
-   */
-  async runGpu(logitsGpuBuffer, params, predOut, scoresOut) {
-    const dev = this.device;
-    const { C, maxLen, V, numTargetTokens } = params;
-    const nPos = C * numTargetTokens;
-    // logits are fp16 (2 B/elem) at the graph boundary.
-    const logitsBytes = 2 * C * maxLen * V * 2;
-
-    this._writeParams(params, {});  // B=2 defaults: uncondBatchOff=C*maxLen
-
-    const bindGroup = dev.createBindGroup({
-      layout: this.bindGroupLayout,
-      entries: [
-        { binding: 0, resource: { buffer: this.paramsBuf } },
-        { binding: 1, resource: { buffer: logitsGpuBuffer, size: logitsBytes } },
-        { binding: 2, resource: { buffer: logitsGpuBuffer, size: logitsBytes } },
-        { binding: 3, resource: { buffer: this.predBuf, size: nPos * 4 } },
-        { binding: 4, resource: { buffer: this.scoresBuf, size: nPos * 4 } },
-      ],
-    });
-
-    const encoder = dev.createCommandEncoder();
-    const pass = encoder.beginComputePass();
-    pass.setPipeline(this.pipeline);
-    pass.setBindGroup(0, bindGroup);
-    pass.dispatchWorkgroups(Math.ceil(nPos / 64));
-    pass.end();
-    encoder.copyBufferToBuffer(this.predBuf, 0, this.predReadBuf, 0, nPos * 4);
-    encoder.copyBufferToBuffer(this.scoresBuf, 0, this.scoresReadBuf, 0, nPos * 4);
-    dev.queue.submit([encoder.finish()]);
-
-    await Promise.all([
-      this.predReadBuf.mapAsync(GPUMapMode.READ),
-      this.scoresReadBuf.mapAsync(GPUMapMode.READ),
-    ]);
-    predOut.set(new Int32Array(this.predReadBuf.getMappedRange(), 0, nPos));
-    scoresOut.set(new Float32Array(this.scoresReadBuf.getMappedRange(), 0, nPos));
-    this.predReadBuf.unmap();
-    this.scoresReadBuf.unmap();
-  }
-
-  /**
    * Zero-copy path, B=1 split mode: cond and uncond logits come from two
-   * independent mainSession.run() calls. We bind each buffer to its own slot
-   * and tell the shader `uncondBatchOff = 0` so both use pure row-major
-   * indexing into their own buffer.
-   *
-   * `ext` must specify condMaxLen/condTargetOff/uncondMaxLen/uncondTargetOff
-   * and leave uncondBatchOff as 0 (the default when omitted here is handled
-   * in _writeParams, but the B=2 default assumes a shared buffer; we pass
-   * 0 explicitly).
+   * independent mainSession.run() calls. Bind each buffer to its own slot and
+   * set uncondBatchOff=0 so both use pure row-major indexing.
    */
-  async runGpuSplit(logitsCondBuf, logitsUncondBuf, condBytes, uncondBytes, params, ext, predOut, scoresOut) {
+  async runGpuSplit(logitsCondBuf, logitsUncondBuf, params, ext, predOut, scoresOut) {
     const dev = this.device;
     const nPos = params.C * params.numTargetTokens;
 
     this._writeParams(params, { ...ext, uncondBatchOff: 0 });
 
-    // ORT may pad its GPU allocations (e.g. to a power-of-two boundary) so
-    // the true backing-buffer size can be larger than `condBytes`/`uncondBytes`.
-    // We omit `size` on the logits bindings and let WebGPU bind the entire
-    // buffer; the shader only reads `condBytes`/`uncondBytes` worth of
-    // elements via its own index math, so over-binding is harmless.
     const bindGroup = dev.createBindGroup({
       layout: this.bindGroupLayout,
       entries: [
@@ -1957,7 +1477,6 @@ class GpuPostProcessor {
         { binding: 4, resource: { buffer: this.scoresBuf, size: nPos * 4 } },
       ],
     });
-    void condBytes; void uncondBytes; // kept as callsite documentation only
 
     const encoder = dev.createCommandEncoder();
     const pass = encoder.beginComputePass();
@@ -1980,10 +1499,10 @@ class GpuPostProcessor {
   }
 
   /**
-   * CPU-staged fallback: ORT-web handed us fp16 logits on CPU
-   * (Float16Array on modern ort-web, Uint16Array on older — both store fp16
-   * bit patterns at 2 B/elem). We upload the raw bytes to the staging logits
-   * buffer and run the same shader as the zero-copy path.
+  * CPU-staged fallback: ORT-web handed us fp16 cond/uncond logits on CPU
+  * (Float16Array on modern ort-web, Uint16Array on older -- both store fp16
+  * bit patterns at 2 B/elem). The caller packs them as cond rows followed by
+  * uncond rows, then this uploads the raw bytes and runs the same shader.
    */
   async run(logits, params, predOut, scoresOut) {
     const dev = this.device;
@@ -1998,7 +1517,7 @@ class GpuPostProcessor {
 
     this._ensureLogitsBuf(fp16Bytes);
 
-    this._writeParams(params, {});  // B=2 defaults
+    this._writeParams(params, {});
 
     dev.queue.writeBuffer(this.logitsBuf, 0, bytesView, 0, fp16Bytes);
 

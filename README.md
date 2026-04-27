@@ -2,23 +2,29 @@
 
 High-performance OmniVoice text-to-speech on WebGPU/Vulkan. This project runs the ONNX model in Chromium through ONNX Runtime WebGPU, which makes it useful on machines that have Vulkan support but no official CUDA or ROCm stack.
 
+I created this project specifically to work on the AMD BC-250, which does not have ROCm/CUDA support.
+
 The production model is hosted on Hugging Face:
 
 https://huggingface.co/MarkShark2/omnivoice-onnx-kv-b1-fp16
 
 ## What Runs Where
 
-- Web UI: the user's browser downloads the tokenizer and ONNX files directly from Hugging Face and runs synthesis locally with WebGPU.
-- API: Python starts FastAPI plus a headless Chromium WebGPU context. Chromium downloads the model from Hugging Face by default and returns OpenAI-style WAV responses.
+- API: Python starts FastAPI plus a headless Chromium WebGPU context on the BC-250. Chromium downloads or serves the B=1 split model bundle and returns OpenAI-style WAV responses.
 - CLI: the CLI sends a request to the API and writes the WAV response. It does not load model files itself.
 
-## Browser Web UI
+## AMD BC-250 Benchmarks
 
-```bash
-python omnivoice_webui.py
-```
+Benchmarks were run on the AMD BC-250 through Chromium WebGPU/Vulkan with the fp16 B=1 KV model at 24 diffusion steps. Longer requests settle around 1.5x real time, measured as generated audio seconds per wall-clock synthesis second.
 
-Open the printed `https://<lan-ip>:7860/webui.html` URL. The LAN server uses HTTPS by default because Chrome requires a trustworthy origin for WebGPU and cross-origin isolation. It creates a self-signed development certificate under `.cert/`; accept the browser warning once.
+| Case | Text | Audio | Synthesis | Speed |
+| --- | ---: | ---: | ---: | ---: |
+| Generic voice | 43 chars | 2.9s | 4.4s | 0.65x |
+| Generic voice | 425 chars | 26.0s | 16.8s | 1.55x |
+| Cloned voice, warm | 76 chars | 6.0s | 4.3s | 1.39x |
+| Cloned voice, warm | 425 chars | 31.5s | 20.8s | 1.52x |
+
+The first cloned-voice request for `sj_short` also generated voice metadata, which added 8.7s once for that API process.
 
 ## API Server
 
@@ -31,6 +37,14 @@ The API listens on `0.0.0.0:8000` by default and exposes:
 - `POST /v1/audio/speech`
 - `GET /v1/audio/models`
 - `GET /v1/audio/voices`
+
+It also serves a simple API-backed web UI at:
+
+```text
+http://<lan-ip>:8000/webui
+```
+
+That page runs no model code in the browser; it sends requests to the API and plays the returned WAV.
 
 Example:
 

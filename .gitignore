@@ -10,6 +10,7 @@ server.log.*
 *.crt
 *.key
 *.pem
+*.wav
 
 __pycache__/
 *.py[cod]

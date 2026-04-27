@@ -91,7 +91,7 @@ Examples:
     parser.add_argument("--t-shift", "--t_shift", type=float, default=0.05, help="Time shift (default: 0.05)")
     parser.add_argument("--seed", type=int, default=None, help="Random seed for deterministic output")
     parser.add_argument("--denoise", type=str, default="true", help="Enable denoising (default: true)")
-    parser.add_argument("--pcm-cache", "--pcm_cache", type=str, default="true", help="Enable API PCM cache (default: true)")
+    parser.add_argument("--pcm-cache", "--pcm_cache", type=str, default="false", help="Legacy compatibility option")
     parser.add_argument("--device", default="webgpu", help="Legacy compatibility option")
     parser.add_argument("--dtype", default="auto", help="Legacy compatibility option")
     parser.add_argument("--duration", type=float, default=None, help="Legacy compatibility option")
@@ -130,10 +130,10 @@ Examples:
     args.api_url = args.api_url or f"http://127.0.0.1:{args.port}"
 
     args.denoise = _parse_bool(args.denoise)
+    args.pcm_cache = _parse_bool(args.pcm_cache)
     args.headless = _parse_bool(args.headless)
     args.preprocess_prompt = _parse_bool(args.preprocess_prompt)
     args.postprocess_output = _parse_bool(args.postprocess_output)
-    args.pcm_cache = _parse_bool(args.pcm_cache)
 
     return args
 
@@ -370,7 +370,6 @@ def run_synthesis(args):
         "guidance_scale": args.guidance_scale,
         "t_shift": args.t_shift,
         "denoise": args.denoise,
-        "pcm_cache": args.pcm_cache,
     }
     if args.seed is not None:
         payload["seed"] = args.seed

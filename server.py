@@ -10,12 +10,10 @@ can POST raw Float32 audio bytes instead of returning them through CDP JSON.
 """
 
 import asyncio
-import mimetypes
 import os
 import threading
 from functools import partial
-from http.server import HTTPServer, SimpleHTTPRequestHandler
-from pathlib import Path
+from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 
 REQUIRED_MODEL_FILES = (
     "omnivoice-config.json",
@@ -179,6 +177,7 @@ class OmniVoiceHandler(SimpleHTTPRequestHandler):
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(file_size))
         self.send_header("Accept-Ranges", "bytes")
+        self._send_cache_headers(filepath)
         self.end_headers()
 
         with open(filepath, "rb") as f:
@@ -210,6 +209,7 @@ class OmniVoiceHandler(SimpleHTTPRequestHandler):
         self.send_header("Content-Length", str(length))
         self.send_header("Content-Range", f"bytes {start}-{end}/{file_size}")
         self.send_header("Accept-Ranges", "bytes")
+        self._send_cache_headers(filepath)
         self.end_headers()
 
         with open(filepath, "rb") as f:
@@ -240,6 +240,12 @@ class OmniVoiceHandler(SimpleHTTPRequestHandler):
             ".css": "text/css",
         }
         return type_map.get(ext, "application/octet-stream")
+
+    def _send_cache_headers(self, filepath):
+        """Keep the app shell fresh while allowing large model files to cache normally."""
+        ext = os.path.splitext(filepath)[1].lower()
+        if ext in {".html", ".js", ".mjs", ".css"}:
+            self.send_header("Cache-Control", "no-store")
 
     def log_message(self, format, *args):
         """Suppress request logging to keep CLI output clean."""
@@ -305,7 +311,7 @@ def start_server(static_dir, model_dir=None, ref_audio_path=None, port=0):
         ref_audio_path=ref_audio_path,
     )
     
-    server = HTTPServer(("127.0.0.1", port), handler)
+    server = ThreadingHTTPServer(("127.0.0.1", port), handler)
     actual_port = server.server_address[1]
     
     thread = threading.Thread(target=server.serve_forever, daemon=True)

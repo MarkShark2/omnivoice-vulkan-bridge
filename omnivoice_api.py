@@ -17,7 +17,7 @@ import hashlib
 from pathlib import Path
 from typing import Optional, Dict, Any
 from fastapi import FastAPI, Request
-from fastapi.responses import Response
+from fastapi.responses import HTMLResponse, Response
 import uvicorn
 from pydantic import BaseModel
 from contextlib import asynccontextmanager
@@ -29,6 +29,7 @@ from omnivoice_cli import read_audio_ffmpeg, write_wav
 _LOG_DIR = Path(__file__).resolve().parent
 _LOG_FILE = _LOG_DIR / "server.log"
 _RUNTIME_DIR = _LOG_DIR / ".runtime"
+LOCAL_MODEL_DIR = _LOG_DIR.parent / "omnivoice-onnx-kv-b1-fp16"
 DEFAULT_MODEL_BASE_URL = "https://huggingface.co/MarkShark2/omnivoice-onnx-kv-b1-fp16/resolve/main"
 
 
@@ -64,6 +65,321 @@ def _configure_logging() -> logging.Logger:
 logger = _configure_logging()
 
 
+def _browser_console_level(msg_type: str, text: str) -> int:
+    if "[W:onnxruntime" in text or re.search(r"\[W:[^\]]*onnxruntime", text):
+        return logging.WARNING
+    if msg_type == "warning":
+        return logging.WARNING
+    if msg_type == "error":
+        return logging.ERROR
+    return logging.DEBUG
+
+
+API_WEBUI_HTML = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <link rel="icon" href="data:,">
+  <title>OmniVoice API Web UI</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f6f8fb;
+      --panel: #ffffff;
+      --ink: #17202a;
+      --muted: #657181;
+      --line: #d9e0ea;
+      --accent: #0f766e;
+      --accent-strong: #0b5f59;
+      --warn: #9a3412;
+      --shadow: 0 12px 30px rgba(23, 32, 42, 0.10);
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      background: var(--bg);
+      color: var(--ink);
+      font: 15px/1.45 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    main {
+      width: min(1120px, calc(100vw - 32px));
+      margin: 0 auto;
+      padding: 28px 0 40px;
+    }
+    header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      margin-bottom: 18px;
+    }
+    h1 { margin: 0; font-size: 28px; font-weight: 720; letter-spacing: 0; }
+    .source { color: var(--muted); font-size: 13px; text-align: right; overflow-wrap: anywhere; }
+    .workspace {
+      display: grid;
+      grid-template-columns: minmax(0, 1.2fr) minmax(320px, 0.8fr);
+      gap: 18px;
+    }
+    section, aside {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      box-shadow: var(--shadow);
+    }
+    .editor, .controls { padding: 18px; }
+    label {
+      display: block;
+      margin: 0 0 7px;
+      color: var(--muted);
+      font-size: 13px;
+      font-weight: 650;
+    }
+    textarea, input, select {
+      width: 100%;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: #fff;
+      color: var(--ink);
+      font: inherit;
+    }
+    textarea {
+      min-height: 330px;
+      resize: vertical;
+      padding: 13px 14px;
+    }
+    input, select { padding: 10px 11px; }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 13px;
+    }
+    .field { margin-bottom: 14px; }
+    .actions {
+      display: flex;
+      gap: 10px;
+      flex-wrap: wrap;
+      margin-top: 16px;
+    }
+    button, a.download {
+      min-height: 40px;
+      border: 1px solid transparent;
+      border-radius: 6px;
+      padding: 0 14px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+      font: inherit;
+      font-weight: 700;
+      text-decoration: none;
+      cursor: pointer;
+    }
+    button.primary { background: var(--accent); color: #fff; }
+    button.primary:hover { background: var(--accent-strong); }
+    button.secondary, a.download {
+      background: #eef2f7;
+      color: var(--ink);
+      border-color: var(--line);
+    }
+    button:disabled, a.download[aria-disabled="true"] {
+      opacity: 0.55;
+      cursor: not-allowed;
+      pointer-events: none;
+    }
+    .status {
+      min-height: 42px;
+      margin: 0;
+      padding: 12px 14px;
+      border-top: 1px solid var(--line);
+      color: var(--muted);
+      font-size: 13px;
+      overflow-wrap: anywhere;
+    }
+    .status[data-tone="warn"] { color: var(--warn); }
+    audio { width: 100%; margin-top: 14px; }
+    @media (max-width: 860px) {
+      header { align-items: flex-start; flex-direction: column; }
+      .source { text-align: left; }
+      .workspace { grid-template-columns: 1fr; }
+      textarea { min-height: 250px; }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <h1>OmniVoice</h1>
+      <div class="source">API-backed synthesis on this server</div>
+    </header>
+    <div class="workspace">
+      <section class="editor">
+        <label for="text">Text</label>
+        <textarea id="text" spellcheck="true">OmniVoice is running on the API server.</textarea>
+      </section>
+      <aside>
+        <div class="controls">
+          <div class="grid">
+            <div class="field">
+              <label for="steps">Steps</label>
+              <input id="steps" type="number" min="4" max="32" step="1" value="24">
+            </div>
+            <div class="field">
+              <label for="speed">Speed</label>
+              <input id="speed" type="number" min="0.5" max="2" step="0.05" value="1.0">
+            </div>
+            <div class="field">
+              <label for="guidance">Guidance</label>
+              <input id="guidance" type="number" min="0" max="8" step="0.1" value="2.0">
+            </div>
+            <div class="field">
+              <label for="seed">Seed</label>
+              <input id="seed" type="number" step="1" value="42">
+            </div>
+          </div>
+          <div class="field">
+            <label for="voice">Voice</label>
+            <select id="voice"><option value="">Default voice</option></select>
+          </div>
+          <div class="field">
+            <label for="refText">Reference Transcript</label>
+            <input id="refText" type="text" placeholder="Optional transcript for selected voice">
+          </div>
+          <div class="field">
+            <label for="instruct">Instruction</label>
+            <input id="instruct" type="text" placeholder="calm, clear narration">
+          </div>
+          <div class="actions">
+            <button id="synthesize" class="primary" type="button">Synthesize</button>
+            <button id="abort" class="secondary" type="button" disabled>Abort</button>
+            <a id="download" class="download" href="#" download="omnivoice.wav" aria-disabled="true">Download WAV</a>
+          </div>
+          <audio id="audio" controls></audio>
+        </div>
+        <p id="status" class="status">Ready.</p>
+      </aside>
+    </div>
+  </main>
+  <script>
+    const els = {
+      text: document.getElementById('text'),
+      steps: document.getElementById('steps'),
+      speed: document.getElementById('speed'),
+      guidance: document.getElementById('guidance'),
+      seed: document.getElementById('seed'),
+      voice: document.getElementById('voice'),
+      refText: document.getElementById('refText'),
+      instruct: document.getElementById('instruct'),
+      synthesize: document.getElementById('synthesize'),
+      abort: document.getElementById('abort'),
+      download: document.getElementById('download'),
+      audio: document.getElementById('audio'),
+      status: document.getElementById('status'),
+    };
+    let currentObjectUrl = null;
+    let currentController = null;
+
+    function setStatus(text, tone = '') {
+      els.status.textContent = text;
+      els.status.dataset.tone = tone;
+    }
+
+    async function loadVoices() {
+      try {
+        const response = await fetch('/v1/audio/voices');
+        if (!response.ok) throw new Error(`voices HTTP ${response.status}`);
+        const data = await response.json();
+        for (const voice of data.voices || []) {
+          const option = document.createElement('option');
+          option.value = voice.id;
+          option.textContent = voice.name || voice.id;
+          els.voice.appendChild(option);
+        }
+      } catch (err) {
+        setStatus(`Could not load voices: ${err.message}`, 'warn');
+      }
+    }
+
+    function resetAudio() {
+      if (currentObjectUrl) URL.revokeObjectURL(currentObjectUrl);
+      currentObjectUrl = null;
+      els.download.href = '#';
+      els.download.setAttribute('aria-disabled', 'true');
+      els.audio.removeAttribute('src');
+    }
+
+    els.synthesize.addEventListener('click', async () => {
+      const text = els.text.value.trim();
+      if (!text) {
+        setStatus('Enter text first.', 'warn');
+        return;
+      }
+
+      resetAudio();
+      els.synthesize.disabled = true;
+      els.abort.disabled = false;
+      currentController = new AbortController();
+      setStatus('Synthesis running on the API server...');
+
+      const payload = {
+        model: 'omnivoice',
+        input: text,
+        voice: els.voice.value || null,
+        response_format: 'wav',
+        speed: Number(els.speed.value),
+        ref_text: els.refText.value.trim() || null,
+        instruct: els.instruct.value.trim() || null,
+        num_step: Number(els.steps.value),
+        guidance_scale: Number(els.guidance.value),
+        t_shift: 0.1,
+        denoise: true,
+      };
+      if (els.seed.value !== '') payload.seed = Number(els.seed.value);
+
+      try {
+        const started = performance.now();
+        const response = await fetch('/v1/audio/speech', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Accept: 'audio/wav' },
+          body: JSON.stringify(payload),
+          signal: currentController.signal,
+        });
+        if (!response.ok) {
+          const body = await response.text();
+          throw new Error(`HTTP ${response.status}: ${body.slice(0, 300)}`);
+        }
+        const blob = await response.blob();
+        currentObjectUrl = URL.createObjectURL(blob);
+        els.audio.src = currentObjectUrl;
+        els.download.href = currentObjectUrl;
+        els.download.removeAttribute('aria-disabled');
+        setStatus(`Generated ${Math.round(blob.size / 1024)} KB WAV in ${((performance.now() - started) / 1000).toFixed(1)}s.`);
+      } catch (err) {
+        if (err.name === 'AbortError') {
+          setStatus('Request aborted.', 'warn');
+        } else {
+          setStatus(err.message, 'warn');
+        }
+      } finally {
+        currentController = null;
+        els.synthesize.disabled = false;
+        els.abort.disabled = true;
+      }
+    });
+
+    els.abort.addEventListener('click', () => {
+      if (currentController) currentController.abort();
+      setStatus('Abort requested.');
+    });
+
+    loadVoices();
+  </script>
+</body>
+</html>
+"""
+
+
 def _text_preview(text: str, max_len: int = 160) -> str:
     t = text.replace("\n", "\\n")
     if len(t) <= max_len:
@@ -78,7 +394,6 @@ playwright_context = None
 model_base_url = None
 synthesis_lock = asyncio.Lock()
 _voice_cache = {}  # voice_name -> dict(pcm, refText, tokens)
-_pcm_cache = {}    # cache_key -> PCM list, or dict(pcm, tokens) for generic chunk refs
 _file_server_port = None  # set during lifespan, used for binary PCM transfer
 
 class SpeechRequest(BaseModel):
@@ -95,7 +410,6 @@ class SpeechRequest(BaseModel):
     t_shift: float = 0.1
     seed: int = 42
     denoise: bool = True
-    pcm_cache: bool = True
 
 def chunk_text(text, max_chars=250):
     chunks = []
@@ -331,20 +645,25 @@ def list_available_models() -> list[dict[str, str]]:
 async def lifespan(app: FastAPI):
     global browser, page, playwright_context, model_base_url, _file_server_port
     
-    # 1. Start HTTP server for static files and binary PCM transfer. By
-    # default the ONNX bundle is fetched directly from Hugging Face; set
-    # OMNIVOICE_HF_CACHE_DIR to serve an already-downloaded Hugging Face cache
-    # snapshot instead.
+    # 1. Start HTTP server for static files and binary PCM transfer. Local
+    # development prefers the freshly packaged hardlinked bundle; set
+    # OMNIVOICE_MODEL_BASE_URL to force a remote URL, or OMNIVOICE_HF_CACHE_DIR
+    # to serve an already-downloaded Hugging Face cache snapshot.
     static_dir = str(Path(__file__).parent)
     model_dir = None
-    if os.environ.get("OMNIVOICE_HF_CACHE_DIR"):
-        model_dir = find_model_snapshot_dir(os.environ["OMNIVOICE_HF_CACHE_DIR"])
+    env_cache_dir = os.environ.get("OMNIVOICE_HF_CACHE_DIR", "").strip()
+    env_model_base_url = os.environ.get("OMNIVOICE_MODEL_BASE_URL", "").strip()
+    if env_cache_dir:
+        model_dir = find_model_snapshot_dir(env_cache_dir)
         logger.info("Mounting Hugging Face cache dir: %s", model_dir)
+    elif not env_model_base_url and LOCAL_MODEL_DIR.is_dir():
+        model_dir = find_model_snapshot_dir(str(LOCAL_MODEL_DIR))
+        logger.info("Mounting local model bundle: %s", model_dir)
     file_server_thread, port = start_server(static_dir=static_dir, model_dir=model_dir, port=0)
     model_base_url = (
         f"http://127.0.0.1:{port}/models"
         if model_dir
-        else os.environ.get("OMNIVOICE_MODEL_BASE_URL", DEFAULT_MODEL_BASE_URL).rstrip("/")
+        else (env_model_base_url or DEFAULT_MODEL_BASE_URL).rstrip("/")
     )
     logger.info("Using model base URL: %s", model_base_url)
     _file_server_port = port
@@ -368,11 +687,7 @@ async def lifespan(app: FastAPI):
     page = await browser.new_page()
     page.set_default_timeout(600000)
     def _console_log(msg):
-        t = msg.type
-        if t in ("error", "warning"):
-            logger.error("[browser %s] %s", t, msg.text)
-        else:
-            logger.debug("[browser] %s", msg.text)
+        logger.log(_browser_console_level(msg.type, msg.text), "[browser %s] %s", msg.type, msg.text)
     page.on("console", _console_log)
     page.on("pageerror", lambda err: logger.error("[browser] %s", err))
     
@@ -386,7 +701,7 @@ async def lifespan(app: FastAPI):
 
     logger.info("Initializing TTS engine models (may take several minutes on first run)")
     try:
-        init_result = await page.evaluate(f"() => window.ttsEngine.init('{model_base_url}')")
+        init_result = await page.evaluate("(url) => window.ttsEngine.init(url)", model_base_url)
         logger.info("Engine ready. Backend: %s", init_result.get("backend", "unknown"))
     except Exception as e:
         logger.exception("Engine init failed: %s", e)
@@ -403,6 +718,16 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(lifespan=lifespan)
+
+
+@app.get("/", response_class=HTMLResponse)
+async def api_webui_root():
+    return HTMLResponse(API_WEBUI_HTML)
+
+
+@app.get("/webui", response_class=HTMLResponse)
+async def api_webui():
+    return HTMLResponse(API_WEBUI_HTML)
 
 
 @app.get("/v1/audio/models")
@@ -585,60 +910,6 @@ async def create_speech(req: SpeechRequest, request: Request):
                             )
                             missing_anchor_logged = True
 
-                # Generic long-form chunking changes the conditioning for
-                # chunks after the first one, so keep those cache entries
-                # separate from old standalone generic chunks.
-                cache_key = (chunk, req.voice, "raw_chunk_v2")
-                if use_generated_chunk_reference:
-                    anchor_mode = (
-                        "generic_chunk_ref"
-                        if idx == 0 or first_chunk_ref_tokens is not None
-                        else "generic_standalone_fallback"
-                    )
-                    cache_key = (
-                        chunk,
-                        req.voice,
-                        "raw_chunk_v2",
-                        anchor_mode,
-                        chunk_fps[0],
-                    )
-
-                if req.pcm_cache and cache_key in _pcm_cache:
-                    cached_entry = _pcm_cache[cache_key]
-                    if isinstance(cached_entry, dict):
-                        cached = cached_entry["pcm"]
-                        cached_tokens = cached_entry.get("tokens")
-                    else:
-                        cached = cached_entry
-                        cached_tokens = None
-                    needs_cached_tokens = use_generated_chunk_reference and idx == 0
-                    if needs_cached_tokens and not cached_tokens:
-                        logger.info(
-                            "rid=%s ignoring tokenless chunk cache entry so chunk reference can be captured fp=%s",
-                            rid,
-                            chunk_fps[idx],
-                        )
-                    else:
-                        if use_generated_chunk_reference and idx == 0:
-                            first_chunk_ref_text = chunk
-                            first_chunk_ref_tokens = cached_tokens
-                            logger.info(
-                                "rid=%s generic chunk reference restored from cache fp=%s tokens=%s",
-                                rid,
-                                chunk_fps[idx],
-                                len(first_chunk_ref_tokens[0]) if first_chunk_ref_tokens else 0,
-                            )
-                        logger.info(
-                            "rid=%s chunk %s/%s CACHE_HIT fp=%s samples=%s voice=%r",
-                            rid,
-                            idx + 1,
-                            len(text_chunks),
-                            chunk_fps[idx],
-                            len(cached),
-                            req.voice,
-                        )
-                        chunk_pcm_arrays.append(cached)
-                        continue
 
                 t0 = time.perf_counter()
                 logger.info(
@@ -670,14 +941,6 @@ async def create_speech(req: SpeechRequest, request: Request):
                     cleanup_pcm_waiter(chunk_rid)
                     raise
 
-                if req.pcm_cache:
-                    if use_generated_chunk_reference:
-                        cache_entry = {"pcm": pcm}
-                        if result.get("audioTokens"):
-                            cache_entry["tokens"] = result["audioTokens"]
-                        _pcm_cache[cache_key] = cache_entry
-                    else:
-                        _pcm_cache[cache_key] = pcm
                 if use_generated_chunk_reference and idx == 0:
                     first_chunk_ref_tokens = result.get("audioTokens")
                     if first_chunk_ref_tokens:
