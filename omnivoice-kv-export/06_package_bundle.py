@@ -11,9 +11,8 @@ from pathlib import Path
 from paths import (
     B1_FP16_KV_DIR,
     FP16_BUNDLE_DIR,
-    OMNIVOICE_CACHE_ROOT,
-    TEMPLATE_BUNDLE_DIR,
     resolve_hf_snapshot,
+    resolve_template_bundle_snapshot,
 )
 
 MAIN_FILES = (
@@ -53,13 +52,13 @@ def link_or_copy(source: Path, destination: Path) -> None:
     print(f"[package-b1] staged {destination.name} <- {source}")
 
 
-def write_runtime_config(snapshot: Path, destination: Path) -> None:
-    template_config = TEMPLATE_BUNDLE_DIR / "omnivoice-config.json"
+def write_runtime_config(source_snapshot: Path, template_snapshot: Path, destination: Path) -> None:
+    template_config = template_snapshot / "omnivoice-config.json"
     if template_config.is_file():
         link_or_copy(template_config, destination)
         return
 
-    full_config = json.loads((snapshot / "config.json").read_text(encoding="utf-8"))
+    full_config = json.loads((source_snapshot / "config.json").read_text(encoding="utf-8"))
     runtime_config = {}
     for key in ("audio_vocab_size", "audio_mask_id", "num_audio_codebook", "audio_codebook_weights"):
         runtime_config[key] = full_config[key]
@@ -80,7 +79,8 @@ def main() -> int:
             print(f"  - {item}", file=sys.stderr)
         return 2
 
-    snapshot = resolve_hf_snapshot(OMNIVOICE_CACHE_ROOT)
+    snapshot = resolve_hf_snapshot()
+    template_snapshot = resolve_template_bundle_snapshot()
     missing = [str(snapshot / name) for name in SNAPSHOT_FILES if not (snapshot / name).is_file()]
     if missing:
         print("[package-b1] missing Hugging Face snapshot file(s):", file=sys.stderr)
@@ -92,12 +92,12 @@ def main() -> int:
     for name in MAIN_FILES:
         link_or_copy(B1_FP16_KV_DIR / name, FP16_BUNDLE_DIR / name)
 
-    write_runtime_config(snapshot, FP16_BUNDLE_DIR / "omnivoice-config.json")
+    write_runtime_config(snapshot, template_snapshot, FP16_BUNDLE_DIR / "omnivoice-config.json")
     for name in SNAPSHOT_FILES:
         link_or_copy(snapshot / name, FP16_BUNDLE_DIR / name)
 
     for name in TEMPLATE_FILES:
-        source = TEMPLATE_BUNDLE_DIR / name
+        source = template_snapshot / name
         if source.is_file():
             link_or_copy(source, FP16_BUNDLE_DIR / name)
 

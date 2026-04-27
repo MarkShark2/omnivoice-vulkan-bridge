@@ -44,13 +44,12 @@ import numpy as np
 import onnx
 import torch
 
-from paths import B1_KV_DIR, OMNIVOICE_CACHE_ROOT, OMNIVOICE_SRC, resolve_hf_snapshot
+from paths import B1_KV_DIR, OMNIVOICE_SRC, resolve_hf_snapshot
 
 torch.set_num_threads(max(1, (os.cpu_count() or 2) // 2))
 torch.set_grad_enabled(False)
 
 HERE = Path(__file__).parent
-CACHE_ROOT = OMNIVOICE_CACHE_ROOT
 OUT_DIR = B1_KV_DIR
 OUT_ONNX = OUT_DIR / "omnivoice-main-kv-b1.onnx"
 OUT_DATA_NAME = "omnivoice-main-kv-b1.onnx_data"
@@ -157,7 +156,7 @@ def main():
     from omnivoice.models.omnivoice import OmniVoice
     from kv_wrapper import OmniVoiceKvWrapper
 
-    snap = resolve_hf_snapshot(CACHE_ROOT)
+    snap = resolve_hf_snapshot()
     print(f"[export-b1] snapshot: {snap}")
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     _clear_output_files()

@@ -33,13 +33,10 @@ import time
 
 import torch
 
-from paths import OMNIVOICE_CACHE_ROOT, OMNIVOICE_SRC, resolve_hf_snapshot
+from paths import OMNIVOICE_SRC, resolve_hf_snapshot
 
 # Keep CPU threading modest; we're only doing one forward.
 torch.set_num_threads(max(1, (os.cpu_count() or 2) // 2))
-
-CACHE_ROOT = OMNIVOICE_CACHE_ROOT
-
 
 def main():
     # Make the in-repo OmniVoice package importable without installing it.
@@ -48,7 +45,7 @@ def main():
     # text utils) that import unconditionally. All needed for from_pretrained.
     from omnivoice.models.omnivoice import OmniVoice
 
-    snap = resolve_hf_snapshot(CACHE_ROOT)
+    snap = resolve_hf_snapshot()
     print(f"[sanity] snapshot: {snap}")
 
     # train=True skips the audio_tokenizer / ASR / duration estimator side-load.

@@ -33,12 +33,11 @@ from pathlib import Path
 import torch
 import torch.nn.functional as F
 
-from paths import OMNIVOICE_CACHE_ROOT, OMNIVOICE_SRC, resolve_hf_snapshot
+from paths import OMNIVOICE_SRC, resolve_hf_snapshot
 
 torch.set_num_threads(max(1, (os.cpu_count() or 2) // 2))
 torch.set_grad_enabled(False)
 
-CACHE_ROOT = OMNIVOICE_CACHE_ROOT
 sys.path.insert(0, str(Path(__file__).parent))
 sys.path.insert(0, str(OMNIVOICE_SRC))
 
@@ -47,7 +46,7 @@ def main():
     from omnivoice.models.omnivoice import OmniVoice
     from kv_wrapper import OmniVoiceKvWrapper
 
-    snap = resolve_hf_snapshot(CACHE_ROOT)
+    snap = resolve_hf_snapshot()
     print(f"[parity] snapshot: {snap}")
 
     model = OmniVoice.from_pretrained(

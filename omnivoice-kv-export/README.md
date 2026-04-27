@@ -19,12 +19,11 @@ Failed INT8/Q4 quantization experiments, portable-model experiments, B=2 exports
 
 ## Portable Paths
 
-Path defaults are defined in `paths.py`. The export scripts use `huggingface_hub` to resolve `k2-fsa/OmniVoice`, downloading it into the Hugging Face cache if the configured cache root is missing. By default, the scripts assume this layout:
+Path defaults are defined in `paths.py`. The export scripts use `huggingface_hub.snapshot_download()` to resolve `k2-fsa/OmniVoice` and the production bundle template through the official Hugging Face cache. The workspace only needs the OmniVoice source checkout for Python imports and a place to write generated ONNX files:
 
 ```text
 workspace/
   OmniVoice/
-  models--k2-fsa--OmniVoice/
   omnivoice-vulkan-bridge/
     omnivoice-kv-export/
       omnivoice-main-kv-b1/
@@ -36,11 +35,10 @@ Override paths with environment variables when your checkout is different:
 
 ```bash
 export OMNIVOICE_SRC_DIR=/path/to/OmniVoice
-export OMNIVOICE_CACHE_ROOT=/path/to/models--k2-fsa--OmniVoice
 export OMNIVOICE_EXPORT_ROOT=/path/for/generated-models
 ```
 
-More specific overrides are also available: `OMNIVOICE_HF_REPO_ID`, `OMNIVOICE_KV_B1_DIR`, `OMNIVOICE_KV_FP16_B1_DIR`, `OMNIVOICE_FP16_BUNDLE_DIR`, `OMNIVOICE_TEMPLATE_BUNDLE_DIR`, `OMNIVOICE_DECODER_ONNX`, `OMNIVOICE_DECODER_WEBGPU_ONNX`, and `OMNIVOICE_ENCODER_ONNX`.
+More specific overrides are also available: `OMNIVOICE_HF_REPO_ID`, `OMNIVOICE_TEMPLATE_BUNDLE_REPO_ID`, `OMNIVOICE_KV_B1_DIR`, `OMNIVOICE_KV_FP16_B1_DIR`, `OMNIVOICE_FP16_BUNDLE_DIR`, `OMNIVOICE_DECODER_ONNX`, `OMNIVOICE_DECODER_WEBGPU_ONNX`, and `OMNIVOICE_ENCODER_ONNX`.
 
 ## Reproducing The Current Model
 
