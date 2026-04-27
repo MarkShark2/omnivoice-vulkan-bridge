@@ -23,14 +23,19 @@ from pydantic import BaseModel
 from contextlib import asynccontextmanager
 
 from playwright.async_api import async_playwright
-from server import find_model_snapshot_dir, start_server, register_pcm_waiter, await_pcm_result, cleanup_pcm_waiter
+from server import (
+    DEFAULT_MODEL_REPO_ID,
+    ensure_hf_model_snapshot_dir,
+    start_server,
+    register_pcm_waiter,
+    await_pcm_result,
+    cleanup_pcm_waiter,
+)
 from omnivoice_cli import read_audio_ffmpeg, write_wav
 
 _LOG_DIR = Path(__file__).resolve().parent
 _LOG_FILE = _LOG_DIR / "server.log"
 _RUNTIME_DIR = _LOG_DIR / ".runtime"
-LOCAL_MODEL_DIR = _LOG_DIR.parent / "omnivoice-onnx-kv-b1-fp16"
-DEFAULT_MODEL_BASE_URL = "https://huggingface.co/MarkShark2/omnivoice-onnx-kv-b1-fp16/resolve/main"
 
 
 def _configure_logging() -> logging.Logger:
@@ -645,26 +650,13 @@ def list_available_models() -> list[dict[str, str]]:
 async def lifespan(app: FastAPI):
     global browser, page, playwright_context, model_base_url, _file_server_port
     
-    # 1. Start HTTP server for static files and binary PCM transfer. Local
-    # development prefers the freshly packaged hardlinked bundle; set
-    # OMNIVOICE_MODEL_BASE_URL to force a remote URL, or OMNIVOICE_HF_CACHE_DIR
-    # to serve an already-downloaded Hugging Face cache snapshot.
+    # 1. Start HTTP server for static files, binary PCM transfer, and the
+    # production model bundle from the Hugging Face cache.
     static_dir = str(Path(__file__).parent)
-    model_dir = None
-    env_cache_dir = os.environ.get("OMNIVOICE_HF_CACHE_DIR", "").strip()
-    env_model_base_url = os.environ.get("OMNIVOICE_MODEL_BASE_URL", "").strip()
-    if env_cache_dir:
-        model_dir = find_model_snapshot_dir(env_cache_dir)
-        logger.info("Mounting Hugging Face cache dir: %s", model_dir)
-    elif not env_model_base_url and LOCAL_MODEL_DIR.is_dir():
-        model_dir = find_model_snapshot_dir(str(LOCAL_MODEL_DIR))
-        logger.info("Mounting local model bundle: %s", model_dir)
+    model_dir = ensure_hf_model_snapshot_dir(DEFAULT_MODEL_REPO_ID)
+    logger.info("Mounting Hugging Face cached model bundle: %s", model_dir)
     file_server_thread, port = start_server(static_dir=static_dir, model_dir=model_dir, port=0)
-    model_base_url = (
-        f"http://127.0.0.1:{port}/models"
-        if model_dir
-        else (env_model_base_url or DEFAULT_MODEL_BASE_URL).rstrip("/")
-    )
+    model_base_url = f"http://127.0.0.1:{port}/models"
     logger.info("Using model base URL: %s", model_base_url)
     _file_server_port = port
 

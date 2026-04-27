@@ -30,33 +30,15 @@ original). That's the "approximation" cost. We just want to:
 import os
 import sys
 import time
-from pathlib import Path
 
 import torch
 
-from paths import OMNIVOICE_CACHE_ROOT, OMNIVOICE_SRC
+from paths import OMNIVOICE_CACHE_ROOT, OMNIVOICE_SRC, resolve_hf_snapshot
 
 # Keep CPU threading modest; we're only doing one forward.
 torch.set_num_threads(max(1, (os.cpu_count() or 2) // 2))
 
-# The k2-fsa checkpoint dir. We hand the snapshot path directly to
-# from_pretrained so huggingface_hub doesn't try to talk to the network.
 CACHE_ROOT = OMNIVOICE_CACHE_ROOT
-
-
-def resolve_snapshot(cache_root: Path) -> Path:
-    """Pick the HF snapshot directory that actually has config.json."""
-    refs = cache_root / "refs" / "main"
-    snapshots = cache_root / "snapshots"
-    if refs.is_file():
-        commit = refs.read_text().strip()
-        cand = snapshots / commit
-        if (cand / "config.json").is_file():
-            return cand
-    for entry in sorted(snapshots.iterdir()):
-        if (entry / "config.json").is_file():
-            return entry
-    raise FileNotFoundError(f"No snapshot with config.json under {cache_root}")
 
 
 def main():
@@ -66,7 +48,7 @@ def main():
     # text utils) that import unconditionally. All needed for from_pretrained.
     from omnivoice.models.omnivoice import OmniVoice
 
-    snap = resolve_snapshot(CACHE_ROOT)
+    snap = resolve_hf_snapshot(CACHE_ROOT)
     print(f"[sanity] snapshot: {snap}")
 
     # train=True skips the audio_tokenizer / ASR / duration estimator side-load.

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Fp16-quantize the B=1 KV graph exported by 04b_export_onnx_b1.py.
+Fp16-quantize the B=1 KV graph exported by 04_export_onnx_b1.py.
 
 Writes:
     $OMNIVOICE_KV_FP16_B1_DIR/
@@ -8,11 +8,8 @@ Writes:
         omnivoice-main-kv-fp16-b1.onnx_data          (single external blob)
         omnivoice-main-kv-fp16-b1-manifest.json      (list of external shards)
 
-This is a thin wrapper around 05_convert_kv_to_fp16's logic — same
-op_block_list, same boundary-Cast repair, same past_*/present_*/
-audio_logits I/O promotion. Only paths differ. We share the import of
-`_promote_kv_io_to_fp16` from the B=2 module so the two converters stay
-in lockstep.
+This uses the same conservative fp16 policy and boundary-Cast repair helpers
+as the original fp16 conversion, but keeps only the production B=1 KV path.
 """
 from __future__ import annotations
 
@@ -29,21 +26,16 @@ from paths import B1_FP16_KV_DIR, B1_KV_DIR
 HERE = Path(__file__).parent
 sys.path.insert(0, str(HERE))
 
-from convert_to_fp16 import (  # type: ignore
-    DEFAULT_OP_BLOCK_LIST,
-    print_initializer_stats,
-    repair_fp16_cast_boundaries,
-)
 from onnxconverter_common import float16  # noqa: E402
 
-# Pull _promote_kv_io_to_fp16 from 05's module without renaming it: the
-# numeric-prefix filename makes a normal `from 05_convert_kv_to_fp16 import`
-# illegal, so we grab it via importlib.
 _spec = importlib.util.spec_from_file_location(
-    "kv_fp16_b2", str(HERE / "05_convert_kv_to_fp16.py")
+    "fp16_kv_utils", str(HERE / "fp16_kv_utils.py")
 )
 _mod = importlib.util.module_from_spec(_spec)  # type: ignore[arg-type]
 _spec.loader.exec_module(_mod)  # type: ignore[union-attr]
+DEFAULT_OP_BLOCK_LIST = _mod.DEFAULT_OP_BLOCK_LIST
+print_initializer_stats = _mod.print_initializer_stats
+repair_fp16_cast_boundaries = _mod.repair_fp16_cast_boundaries
 _promote_kv_io_to_fp16 = _mod._promote_kv_io_to_fp16
 
 SRC_DIR = B1_KV_DIR

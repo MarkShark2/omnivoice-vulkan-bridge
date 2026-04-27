@@ -25,12 +25,11 @@ which is too noisy to be meaningful.
 import os
 import sys
 import time
-from pathlib import Path
 
 import torch
 import torch.nn.functional as F
 
-from paths import OMNIVOICE_CACHE_ROOT, OMNIVOICE_SRC
+from paths import OMNIVOICE_CACHE_ROOT, OMNIVOICE_SRC, resolve_hf_snapshot
 
 torch.set_num_threads(max(1, (os.cpu_count() or 2) // 2))
 # Use no_grad instead of inference_mode: we need to do tensor-slice/update
@@ -38,20 +37,6 @@ torch.set_num_threads(max(1, (os.cpu_count() or 2) // 2))
 # tensors can't be fed back into autograd-tracked code (e.g. .view + linear).
 torch.set_grad_enabled(False)
 CACHE_ROOT = OMNIVOICE_CACHE_ROOT
-
-
-def resolve_snapshot(cache_root: Path) -> Path:
-    refs = cache_root / "refs" / "main"
-    snapshots = cache_root / "snapshots"
-    if refs.is_file():
-        commit = refs.read_text().strip()
-        cand = snapshots / commit
-        if (cand / "config.json").is_file():
-            return cand
-    for entry in sorted(snapshots.iterdir()):
-        if (entry / "config.json").is_file():
-            return entry
-    raise FileNotFoundError(f"No snapshot with config.json under {cache_root}")
 
 
 def softmax_js_div(a: torch.Tensor, b: torch.Tensor, dim: int = -1) -> float:
@@ -70,7 +55,7 @@ def main():
     from omnivoice.models.omnivoice import OmniVoice
     from transformers import DynamicCache
 
-    snap = resolve_snapshot(CACHE_ROOT)
+    snap = resolve_hf_snapshot(CACHE_ROOT)
     print(f"[plumb] snapshot: {snap}")
 
     model = OmniVoice.from_pretrained(

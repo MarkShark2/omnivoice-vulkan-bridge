@@ -15,6 +15,8 @@ import threading
 from functools import partial
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 
+DEFAULT_MODEL_REPO_ID = "MarkShark2/omnivoice-onnx-kv-b1-fp16"
+
 REQUIRED_MODEL_FILES = (
     "omnivoice-config.json",
     "tokenizer.json",
@@ -29,6 +31,16 @@ REQUIRED_MODEL_FILES = (
 
 def _has_required_model_files(model_dir):
     return all(os.path.isfile(os.path.join(model_dir, name)) for name in REQUIRED_MODEL_FILES)
+
+
+def _is_hf_snapshot_dir(model_dir, repo_id=DEFAULT_MODEL_REPO_ID):
+    model_dir = os.path.realpath(model_dir)
+    repo_cache_dir = os.path.basename(os.path.dirname(os.path.dirname(model_dir)))
+    expected_repo_cache_dir = "models--" + repo_id.replace("/", "--")
+    return (
+        os.path.basename(os.path.dirname(model_dir)) == "snapshots"
+        and repo_cache_dir == expected_repo_cache_dir
+    )
 
 # ─── Binary PCM result coordination ──────────────────────────────────────────
 # The browser POSTs raw Float32 PCM bytes to /_results/<rid>.  The API layer
@@ -126,7 +138,7 @@ class OmniVoiceHandler(SimpleHTTPRequestHandler):
         # Route: /models/<filename> → serve from model directory
         if self.path.startswith("/models/"):
             if not self.model_dir:
-                self.send_error(404, "No local model directory is configured")
+                self.send_error(404, "No Hugging Face cache snapshot is configured")
                 return
             filename = self.path[len("/models/"):]
             # Strip query string
@@ -252,20 +264,25 @@ class OmniVoiceHandler(SimpleHTTPRequestHandler):
         pass
 
 
-def find_model_snapshot_dir(model_dir):
+def find_model_snapshot_dir(model_dir, repo_id=DEFAULT_MODEL_REPO_ID):
     """
-    Resolve the HuggingFace cache model directory to the production snapshot.
-    
+    Resolve the Hugging Face cache model directory to the production snapshot.
+
     Supports:
-    - Direct path to a directory containing model files
-    - HuggingFace cache structure (models--org--repo/)
+    - Hugging Face cache structure (models--org--repo/)
+    - Hugging Face cache snapshot path (models--org--repo/snapshots/<commit>/)
     """
     model_dir = os.path.realpath(model_dir)
-    
-    # Check if this already has model files directly
-    if _has_required_model_files(model_dir):
+
+    if _is_hf_snapshot_dir(model_dir, repo_id) and _has_required_model_files(model_dir):
         return model_dir
-    
+
+    expected_repo_cache_dir = "models--" + repo_id.replace("/", "--")
+    if os.path.basename(model_dir) != expected_repo_cache_dir:
+        raise FileNotFoundError(
+            f"Expected Hugging Face cache root {expected_repo_cache_dir} or one of its snapshots, got: {model_dir}"
+        )
+
     # Check HuggingFace cache structure
     snapshots_dir = os.path.join(model_dir, "snapshots")
     if os.path.isdir(snapshots_dir):
@@ -285,10 +302,47 @@ def find_model_snapshot_dir(model_dir):
                 return candidate
     
     raise FileNotFoundError(
-        f"Could not find the OmniVoice fp16 KV B=1 model bundle in: {model_dir}\n"
-        f"Expected either model files directly or a HuggingFace cache structure containing:\n"
+        f"Could not find the OmniVoice fp16 KV B=1 model bundle in the Hugging Face cache: {model_dir}\n"
+        f"Expected a Hugging Face cache root or snapshot for {repo_id} containing:\n"
         + "\n".join(f"  - {name}" for name in REQUIRED_MODEL_FILES)
     )
+
+
+def get_hf_cache_dir(repo_id=DEFAULT_MODEL_REPO_ID):
+    """Return the standard Hugging Face cache root for a repo id."""
+    cache_home = os.environ.get("HF_HOME")
+    if cache_home:
+        hub_dir = os.path.join(cache_home, "hub")
+    else:
+        hub_dir = os.path.join(os.path.expanduser("~"), ".cache", "huggingface", "hub")
+    return os.path.join(hub_dir, "models--" + repo_id.replace("/", "--"))
+
+
+def ensure_hf_model_snapshot_dir(repo_id=DEFAULT_MODEL_REPO_ID):
+    """Ensure the production bundle exists in the Hugging Face cache and return its snapshot dir."""
+    env_cache_dir = os.environ.get("OMNIVOICE_HF_CACHE_DIR", "").strip()
+    candidates = [env_cache_dir] if env_cache_dir else []
+    candidates.append(get_hf_cache_dir(repo_id))
+
+    for candidate in candidates:
+        if not candidate:
+            continue
+        try:
+            return find_model_snapshot_dir(candidate, repo_id=repo_id)
+        except FileNotFoundError:
+            pass
+
+    try:
+        from huggingface_hub import snapshot_download
+    except ImportError as exc:
+        raise RuntimeError(
+            f"Could not find {repo_id} in the Hugging Face cache, and huggingface_hub "
+            "is not installed. Install huggingface_hub or set OMNIVOICE_HF_CACHE_DIR "
+            "to a cached snapshot containing the required model files."
+        ) from exc
+
+    snapshot_dir = snapshot_download(repo_id=repo_id, local_files_only=False)
+    return find_model_snapshot_dir(snapshot_dir, repo_id=repo_id)
 
 
 def start_server(static_dir, model_dir=None, ref_audio_path=None, port=0):
@@ -297,7 +351,7 @@ def start_server(static_dir, model_dir=None, ref_audio_path=None, port=0):
     
     Args:
         static_dir: Path to directory containing inference.html and tts-engine.js
-        model_dir: Path to directory containing ONNX model files
+        model_dir: Path to Hugging Face cache snapshot containing ONNX model files
         ref_audio_path: Optional path to reference audio file for voice cloning
         port: Port to listen on (0 = auto-assign)
     

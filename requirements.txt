@@ -1,4 +1,5 @@
 fastapi
+huggingface_hub
 playwright
 pydantic
 uvicorn[standard]

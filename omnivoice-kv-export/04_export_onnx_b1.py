@@ -44,7 +44,7 @@ import numpy as np
 import onnx
 import torch
 
-from paths import B1_KV_DIR, OMNIVOICE_CACHE_ROOT, OMNIVOICE_SRC
+from paths import B1_KV_DIR, OMNIVOICE_CACHE_ROOT, OMNIVOICE_SRC, resolve_hf_snapshot
 
 torch.set_num_threads(max(1, (os.cpu_count() or 2) // 2))
 torch.set_grad_enabled(False)
@@ -59,17 +59,15 @@ sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(OMNIVOICE_SRC))
 
 
-def resolve_snapshot(cache_root: Path) -> Path:
-    refs = cache_root / "refs" / "main"
-    snapshots = cache_root / "snapshots"
-    if refs.is_file():
-        cand = snapshots / refs.read_text().strip()
-        if (cand / "config.json").is_file():
-            return cand
-    for entry in sorted(snapshots.iterdir()):
-        if (entry / "config.json").is_file():
-            return entry
-    raise FileNotFoundError(f"No snapshot under {cache_root}")
+def _clear_output_files(keep: set[str] | None = None) -> None:
+    keep = keep or set()
+    if not OUT_DIR.is_dir():
+        return
+    for path in OUT_DIR.iterdir():
+        if path.name in keep:
+            continue
+        if path.is_file() or path.is_symlink():
+            path.unlink()
 
 
 def _example_inputs_b1(model, S_full=24, S_new=None):
@@ -159,9 +157,10 @@ def main():
     from omnivoice.models.omnivoice import OmniVoice
     from kv_wrapper import OmniVoiceKvWrapper
 
-    snap = resolve_snapshot(CACHE_ROOT)
+    snap = resolve_hf_snapshot(CACHE_ROOT)
     print(f"[export-b1] snapshot: {snap}")
     OUT_DIR.mkdir(parents=True, exist_ok=True)
+    _clear_output_files()
 
     t0 = time.time()
     model = OmniVoice.from_pretrained(
@@ -216,8 +215,7 @@ def main():
         del init.external_data[:]
         init.data_location = onnx.TensorProto.DEFAULT
 
-    for f in OUT_DIR.glob("omnivoice-main-kv-b1.onnx_data*"):
-        f.unlink()
+    _clear_output_files(keep={OUT_ONNX.name})
 
     onnx.save_model(
         m,

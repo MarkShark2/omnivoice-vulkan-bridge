@@ -33,7 +33,7 @@ from pathlib import Path
 import torch
 import torch.nn.functional as F
 
-from paths import OMNIVOICE_CACHE_ROOT, OMNIVOICE_SRC
+from paths import OMNIVOICE_CACHE_ROOT, OMNIVOICE_SRC, resolve_hf_snapshot
 
 torch.set_num_threads(max(1, (os.cpu_count() or 2) // 2))
 torch.set_grad_enabled(False)
@@ -43,24 +43,11 @@ sys.path.insert(0, str(Path(__file__).parent))
 sys.path.insert(0, str(OMNIVOICE_SRC))
 
 
-def resolve_snapshot(cache_root: Path) -> Path:
-    refs = cache_root / "refs" / "main"
-    snapshots = cache_root / "snapshots"
-    if refs.is_file():
-        cand = snapshots / refs.read_text().strip()
-        if (cand / "config.json").is_file():
-            return cand
-    for entry in sorted(snapshots.iterdir()):
-        if (entry / "config.json").is_file():
-            return entry
-    raise FileNotFoundError(f"No snapshot under {cache_root}")
-
-
 def main():
     from omnivoice.models.omnivoice import OmniVoice
     from kv_wrapper import OmniVoiceKvWrapper
 
-    snap = resolve_snapshot(CACHE_ROOT)
+    snap = resolve_hf_snapshot(CACHE_ROOT)
     print(f"[parity] snapshot: {snap}")
 
     model = OmniVoice.from_pretrained(

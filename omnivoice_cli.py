@@ -23,6 +23,8 @@ import urllib.request
 import wave
 from pathlib import Path
 
+from server import DEFAULT_MODEL_REPO_ID, ensure_hf_model_snapshot_dir
+
 try:
     sys.stdout.reconfigure(line_buffering=True)
     sys.stderr.reconfigure(line_buffering=True)
@@ -32,22 +34,6 @@ except AttributeError:
 
 def _parse_bool(value: str) -> bool:
     return str(value).strip().lower() in ("true", "1", "yes", "on")
-
-
-REQUIRED_MODEL_FILES = (
-    "omnivoice-config.json",
-    "tokenizer.json",
-    "tokenizer_config.json",
-    "omnivoice-main-kv-fp16-b1.onnx",
-    "omnivoice-main-kv-fp16-b1.onnx_data",
-    "omnivoice-main-kv-fp16-b1-manifest.json",
-    "omnivoice-decoder-webgpu.onnx",
-    "omnivoice-encoder-fixed.onnx",
-)
-
-
-def _looks_like_production_model_dir(path: Path) -> bool:
-    return all((path / name).is_file() for name in REQUIRED_MODEL_FILES)
 
 
 def parse_args():
@@ -140,37 +126,12 @@ Examples:
 
 def find_default_model_dir():
     """
-    Auto-detect the production ONNX model in the Hugging Face cache.
+    Auto-detect or download the production ONNX model in the Hugging Face cache.
 
     Kept for compatibility with older local tooling; the API no longer calls
     this unless a user explicitly chooses cache-backed model serving.
     """
-    candidates = []
-    if os.environ.get("OMNIVOICE_HF_CACHE_DIR"):
-        candidates.append(Path(os.environ["OMNIVOICE_HF_CACHE_DIR"]))
-    for candidate in candidates:
-        if candidate.is_dir() and _looks_like_production_model_dir(candidate):
-            return str(candidate)
-
-    model_cache = Path.home() / ".cache" / "huggingface" / "hub" / "models--MarkShark2--omnivoice-onnx-kv-b1-fp16"
-    snapshots_dir = model_cache / "snapshots"
-    refs_main = model_cache / "refs" / "main"
-    if refs_main.is_file():
-        snapshot = snapshots_dir / refs_main.read_text().strip()
-        if snapshot.is_dir() and _looks_like_production_model_dir(snapshot):
-            return str(snapshot)
-
-    if snapshots_dir.is_dir():
-        for snapshot in sorted(snapshots_dir.iterdir()):
-            if snapshot.is_dir() and _looks_like_production_model_dir(snapshot):
-                return str(snapshot)
-
-    raise FileNotFoundError(
-        "Could not find MarkShark2/omnivoice-onnx-kv-b1-fp16 in the Hugging Face cache.\n"
-        "Download it with `huggingface-cli download MarkShark2/omnivoice-onnx-kv-b1-fp16` "
-        "or set OMNIVOICE_HF_CACHE_DIR to that model's cache/snapshot directory containing:\n"
-        + "\n".join(f"  - {name}" for name in REQUIRED_MODEL_FILES)
-    )
+    return ensure_hf_model_snapshot_dir(DEFAULT_MODEL_REPO_ID)
 
 
 def read_audio_ffmpeg(path, target_sr=24000):

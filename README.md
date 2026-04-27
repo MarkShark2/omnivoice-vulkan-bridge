@@ -10,7 +10,7 @@ https://huggingface.co/MarkShark2/omnivoice-onnx-kv-b1-fp16
 
 ## What Runs Where
 
-- API: Python starts FastAPI plus a headless Chromium WebGPU context on the BC-250. Chromium downloads or serves the B=1 split model bundle and returns OpenAI-style WAV responses.
+- API: Python starts FastAPI plus a headless Chromium WebGPU context on the BC-250. It resolves the B=1 split model bundle from the Hugging Face cache, downloading it on first run if needed, then serves those cached files to Chromium and returns OpenAI-style WAV responses.
 - CLI: the CLI sends a request to the API and writes the WAV response. It does not load model files itself.
 
 ## AMD BC-250 Benchmarks
@@ -31,6 +31,8 @@ The first cloned-voice request for `sj_short` also generated voice metadata, whi
 ```bash
 python omnivoice_api.py
 ```
+
+On startup the API resolves `MarkShark2/omnivoice-onnx-kv-b1-fp16` through `huggingface_hub`. If the bundle is not already in the Hugging Face cache, it is downloaded there first; the API then serves the cached snapshot files to Chromium.
 
 The API listens on `0.0.0.0:8000` by default and exposes:
 
@@ -88,4 +90,4 @@ Then pass that id to the API or CLI as `voice="sj_short"`. Voice metadata is gen
 
 ## KVB1 Export Tools
 
-The trimmed export scripts in `omnivoice-kv-export/` document the path used to produce the current fp16 B=1 KV main model. They are portable across machines through environment-variable path overrides and omit older B=2, quantization, and portable-model experiments.
+The production export scripts in `omnivoice-kv-export/` document the path used to produce the current fp16 B=1 KV main model plus the WebGPU-ready encoder and decoder artifacts. They are portable across machines through environment-variable path overrides and omit older B=2, failed quantization, and portable-model experiments.

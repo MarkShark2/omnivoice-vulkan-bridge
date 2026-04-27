@@ -23,5 +23,13 @@ __pycache__/
 benchmark_results.json
 bench_out/
 
+# Generated KV export pipeline artifacts
+omnivoice-kv-export/omnivoice-main-kv-b1/
+omnivoice-kv-export/omnivoice-main-kv-fp16-b1/
+omnivoice-kv-export/omnivoice-onnx-kv-b1-fp16/
+omnivoice-kv-export/**/*.onnx
+omnivoice-kv-export/**/*.onnx_data
+omnivoice-kv-export/**/*-manifest.json
+
 notes.md
 .DS_Store
