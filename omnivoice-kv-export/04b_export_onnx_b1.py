@@ -2,7 +2,7 @@
 """
 Export OmniVoiceKvWrapper to ONNX **at batch size 1**.
 
-Output: /home/mark/omnivoice/omnivoice-main-kv-b1/omnivoice-main-kv-b1.onnx
+Output: $OMNIVOICE_KV_B1_DIR/omnivoice-main-kv-b1.onnx
          + omnivoice-main-kv-b1.onnx_data
 
 Why a B=1 variant
@@ -44,13 +44,14 @@ import numpy as np
 import onnx
 import torch
 
+from paths import B1_KV_DIR, OMNIVOICE_CACHE_ROOT, OMNIVOICE_SRC
+
 torch.set_num_threads(max(1, (os.cpu_count() or 2) // 2))
 torch.set_grad_enabled(False)
 
 HERE = Path(__file__).parent
-OMNIVOICE_SRC = Path("/home/mark/omnivoice/OmniVoice")
-CACHE_ROOT = Path("/home/mark/omnivoice/models--k2-fsa--OmniVoice")
-OUT_DIR = Path("/home/mark/omnivoice/omnivoice-main-kv-b1")
+CACHE_ROOT = OMNIVOICE_CACHE_ROOT
+OUT_DIR = B1_KV_DIR
 OUT_ONNX = OUT_DIR / "omnivoice-main-kv-b1.onnx"
 OUT_DATA_NAME = "omnivoice-main-kv-b1.onnx_data"
 

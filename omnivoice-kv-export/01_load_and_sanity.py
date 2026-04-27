@@ -34,12 +34,14 @@ from pathlib import Path
 
 import torch
 
+from paths import OMNIVOICE_CACHE_ROOT, OMNIVOICE_SRC
+
 # Keep CPU threading modest; we're only doing one forward.
 torch.set_num_threads(max(1, (os.cpu_count() or 2) // 2))
 
 # The k2-fsa checkpoint dir. We hand the snapshot path directly to
 # from_pretrained so huggingface_hub doesn't try to talk to the network.
-CACHE_ROOT = Path("/home/mark/omnivoice/models--k2-fsa--OmniVoice")
+CACHE_ROOT = OMNIVOICE_CACHE_ROOT
 
 
 def resolve_snapshot(cache_root: Path) -> Path:
@@ -59,7 +61,7 @@ def resolve_snapshot(cache_root: Path) -> Path:
 
 def main():
     # Make the in-repo OmniVoice package importable without installing it.
-    sys.path.insert(0, "/home/mark/omnivoice/OmniVoice")
+    sys.path.insert(0, str(OMNIVOICE_SRC))
     # The OmniVoice package has optional deps (torchaudio, duration estimator,
     # text utils) that import unconditionally. All needed for from_pretrained.
     from omnivoice.models.omnivoice import OmniVoice

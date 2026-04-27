@@ -33,12 +33,14 @@ from pathlib import Path
 import torch
 import torch.nn.functional as F
 
+from paths import OMNIVOICE_CACHE_ROOT, OMNIVOICE_SRC
+
 torch.set_num_threads(max(1, (os.cpu_count() or 2) // 2))
 torch.set_grad_enabled(False)
 
-CACHE_ROOT = Path("/home/mark/omnivoice/models--k2-fsa--OmniVoice")
+CACHE_ROOT = OMNIVOICE_CACHE_ROOT
 sys.path.insert(0, str(Path(__file__).parent))
-sys.path.insert(0, "/home/mark/omnivoice/OmniVoice")
+sys.path.insert(0, str(OMNIVOICE_SRC))
 
 
 def resolve_snapshot(cache_root: Path) -> Path:

@@ -3,7 +3,7 @@
 Fp16-quantize the B=1 KV graph exported by 04b_export_onnx_b1.py.
 
 Writes:
-    /home/mark/omnivoice/omnivoice-main-kv-fp16-b1/
+    $OMNIVOICE_KV_FP16_B1_DIR/
         omnivoice-main-kv-fp16-b1.onnx
         omnivoice-main-kv-fp16-b1.onnx_data          (single external blob)
         omnivoice-main-kv-fp16-b1-manifest.json      (list of external shards)
@@ -24,9 +24,10 @@ from pathlib import Path
 
 import onnx
 
+from paths import B1_FP16_KV_DIR, B1_KV_DIR
+
 HERE = Path(__file__).parent
 sys.path.insert(0, str(HERE))
-sys.path.insert(0, str(Path("/home/mark/omnivoice")))
 
 from convert_to_fp16 import (  # type: ignore
     DEFAULT_OP_BLOCK_LIST,
@@ -45,11 +46,11 @@ _mod = importlib.util.module_from_spec(_spec)  # type: ignore[arg-type]
 _spec.loader.exec_module(_mod)  # type: ignore[union-attr]
 _promote_kv_io_to_fp16 = _mod._promote_kv_io_to_fp16
 
-SRC_DIR = Path("/home/mark/omnivoice/omnivoice-main-kv-b1")
+SRC_DIR = B1_KV_DIR
 SRC_ONNX = SRC_DIR / "omnivoice-main-kv-b1.onnx"
 SRC_DATA = SRC_DIR / "omnivoice-main-kv-b1.onnx_data"
 
-OUT_DIR = Path("/home/mark/omnivoice/omnivoice-main-kv-fp16-b1")
+OUT_DIR = B1_FP16_KV_DIR
 OUT_ONNX = OUT_DIR / "omnivoice-main-kv-fp16-b1.onnx"
 OUT_DATA_NAME = "omnivoice-main-kv-fp16-b1.onnx_data"
 MANIFEST_NAME = "omnivoice-main-kv-fp16-b1-manifest.json"

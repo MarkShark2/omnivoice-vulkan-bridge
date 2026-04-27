@@ -85,3 +85,7 @@ Then pass that id to the API or CLI as `voice="sj_short"`. Voice metadata is gen
 - WebGPU encoder: reference-audio encoding runs on WebGPU with a WASM fallback.
 - Binary PCM transfer: API synthesis results are posted from Chromium to Python as raw Float32 bytes instead of large JSON arrays.
 - Long-form chunk plumbing: text is chunked, generated audio is cross-faded, and generic long-form requests can condition later chunks on the first chunk's audio tokens.
+
+## KVB1 Export Tools
+
+The trimmed export scripts in `omnivoice-kv-export/` document the path used to produce the current fp16 B=1 KV main model. They are portable across machines through environment-variable path overrides and omit older B=2, quantization, and portable-model experiments.

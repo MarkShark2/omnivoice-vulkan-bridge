@@ -6,7 +6,7 @@ etc. in fp32, and we repair Cast boundaries post-conversion so ORT doesn't
 reject the session with "Type parameter bound to different types".
 
 Writes:
-    /home/mark/omnivoice/omnivoice-main-kv-fp16/
+    $OMNIVOICE_KV_FP16_DIR/
         omnivoice-main-kv-fp16.onnx
         omnivoice-main-kv-fp16.onnx_data         (single external blob)
         omnivoice-main-kv-fp16-manifest.json     (list of external shards)
@@ -25,9 +25,11 @@ from pathlib import Path
 import onnx
 from onnx import TensorProto
 
-# Reuse the shared fp16 helpers from convert_to_fp16.py (same directory
-# layout as the rest of the repo tools).
-sys.path.insert(0, str(Path("/home/mark/omnivoice")))
+from paths import FP16_KV_DIR, FP32_KV_DIR
+
+# Reuse the shared fp16 helpers copied into this folder so the export bundle is
+# self-contained inside the bridge repo.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 from convert_to_fp16 import (  # type: ignore
     DEFAULT_OP_BLOCK_LIST,
     initializer_stats,
@@ -36,11 +38,11 @@ from convert_to_fp16 import (  # type: ignore
 )
 from onnxconverter_common import float16  # noqa: E402
 
-SRC_DIR = Path("/home/mark/omnivoice/omnivoice-main-kv")
+SRC_DIR = FP32_KV_DIR
 SRC_ONNX = SRC_DIR / "omnivoice-main-kv.onnx"
 SRC_DATA = SRC_DIR / "omnivoice-main-kv.onnx_data"  # single external blob
 
-OUT_DIR = Path("/home/mark/omnivoice/omnivoice-main-kv-fp16")
+OUT_DIR = FP16_KV_DIR
 OUT_ONNX = OUT_DIR / "omnivoice-main-kv-fp16.onnx"
 OUT_DATA_NAME = "omnivoice-main-kv-fp16.onnx_data"
 MANIFEST_NAME = "omnivoice-main-kv-fp16-manifest.json"
